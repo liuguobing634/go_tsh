@@ -19,6 +19,15 @@ type Token struct {
 	// 在 "quick the brown" 中 quick 与 brown 的位置差为 2，
 	// 因而不会误命中短语 "quick brown"。
 	Position uint32 `json:"position"`
+
+	// Start 是词条在原文中的起始**字节**偏移，End 是结束后的字节偏移。
+	//
+	// 原文区间 [Start, End) 正是高亮要包裹的范围。索引与打分完全不用它们，
+	// 但记录它们的成本只是两次 int 赋值，远比事后重新切分一遍原文划算——
+	// 重新切分不仅浪费，更要命的是会引入第二套切分规则，
+	// 与这里的规则一旦走偏就是「高亮结果和检索结果对不上」。
+	Start int `json:"-"`
+	End   int `json:"-"`
 }
 
 // Analyzer 把原始文本转换成有序的 token 序列。

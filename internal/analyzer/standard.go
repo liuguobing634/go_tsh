@@ -3,6 +3,7 @@ package analyzer
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // defaultMinTokenLen 是保留一个词条所需的最小 rune 数。
@@ -81,12 +82,15 @@ func (a *StandardAnalyzer) Analyze(text string) []Token {
 	}
 
 	// 先整体转成 []rune：撇号需要向后看一个字符，rune 切片让逻辑清晰得多。
-	runes := []rune(text)
-	tokens := make([]Token, 0, estimateTokens(len(runes)))
+	tokens := make([]Token, 0, estimateTokens(len(text)))
 
 	// word 复用同一块底层数组，flush 后通过 word[:0] 归零，避免反复分配。
-	var word []rune
-	var pos uint32
+	var (
+		word      []rune
+		wordStart int // 当前词条的起始字节偏移
+		wordEnd   int // 当前词条结束后的字节偏移
+		pos       uint32
+	)
 
 	// flush 为一个词条收尾。无论是否保留，pos 都会前进，
 	// 这样被过滤掉的词条会在位置序列里留下空隙。
@@ -96,38 +100,71 @@ func (a *StandardAnalyzer) Analyze(text string) []Token {
 			return
 		}
 		term := string(word)
+		start, end := wordStart, wordEnd
 		word = word[:0]
 
 		if n >= a.minTokenLen && !a.isStopword(term) {
-			tokens = append(tokens, Token{Term: term, Position: pos})
+			tokens = append(tokens, Token{
+				Term:     term,
+				Position: pos,
+				Start:    start,
+				End:      end,
+			})
 		}
 		pos++
 	}
 
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
+	// 用字节游标而不是先转 []rune：
+	//  1. 省掉一次 O(n) 的分配（[]rune 是 4 字节/rune）；
+	//  2. 字节偏移本来就是手头就有的，记录 Start/End 因此是免费的。
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
 
 		switch {
 		case isUnigramScript(r):
 			flush()
-			tokens = append(tokens, Token{Term: string(unicode.ToLower(r)), Position: pos})
+			tokens = append(tokens, Token{
+				Term:     string(unicode.ToLower(r)),
+				Position: pos,
+				Start:    i,
+				End:      i + size,
+			})
 			pos++
+			i += size
 
 		case isWordRune(r):
+			if len(word) == 0 {
+				wordStart = i
+			}
 			word = append(word, unicode.ToLower(foldFullWidth(r)))
+			wordEnd = i + size
+			i += size
 
-		case isApostrophe(r) && len(word) > 0 && i+1 < len(runes) && isWordRune(runes[i+1]):
+		case isApostrophe(r) && len(word) > 0 && hasWordRuneAt(text, i+size):
 			// 词内撇号：don't / it's 保持为单个 token。
 			// 统一写成直引号，避免弯引号（U+2019）造成同一词两种形态。
 			word = append(word, '\'')
+			wordEnd = i + size
+			i += size
 
 		default:
 			flush()
+			i += size
 		}
 	}
 	flush()
 
 	return tokens
+}
+
+// hasWordRuneAt 报告 text[i:] 处的 rune 是否能作为词条字符。
+// 越界或非法 UTF-8 都返回 false。
+func hasWordRuneAt(text string, i int) bool {
+	if i >= len(text) {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(text[i:])
+	return isWordRune(r)
 }
 
 // isStopword 报告归一化后的词条是否在停用词表中。

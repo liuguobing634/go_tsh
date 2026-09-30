@@ -45,6 +45,13 @@ func New(cfg config.Config, engine *tsh.Engine, log *slog.Logger) *Server {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
 
+	mux.HandleFunc("POST /api/v1/documents", s.handleCreateDocument)
+	mux.HandleFunc("PUT /api/v1/documents/{id}", s.handlePutDocument)
+	mux.HandleFunc("GET /api/v1/documents/{id}", s.handleGetDocument)
+	mux.HandleFunc("DELETE /api/v1/documents/{id}", s.handleDeleteDocument)
+
+	mux.HandleFunc("GET /api/v1/search", s.handleSearch)
+
 	s.Server = &http.Server{
 		Addr:         cfg.Addr,
 		Handler:      chain(mux, s.withRecover, s.withRequestLog, s.withBodyLimit),

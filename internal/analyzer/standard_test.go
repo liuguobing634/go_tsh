@@ -9,7 +9,23 @@ import (
 )
 
 // tk 是构造期望 Token 的简写，让测试表更紧凑。
+//
+// 只设置 Term 与 Position：Start/End 是原文偏移，由
+// TestTokenOffsets 专门覆盖，不该污染切分用例的期望值。
 func tk(term string, pos uint32) Token { return Token{Term: term, Position: pos} }
+
+// sameTerms 比较两个 token 序列的词条与位置，忽略原文偏移。
+func sameTerms(got, want []Token) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i].Term != want[i].Term || got[i].Position != want[i].Position {
+			return false
+		}
+	}
+	return true
+}
 
 func TestAnalyze(t *testing.T) {
 	// 绝大多数用例只想验证「切分与归一化」，因此默认关闭停用词过滤。
@@ -61,10 +77,120 @@ func TestAnalyze(t *testing.T) {
 				a = filtering
 			}
 			got := a.Analyze(tc.text)
-			if !slices.Equal(got, tc.want) {
+			if !sameTerms(got, tc.want) {
 				t.Fatalf("Analyze(%q)\n got: %v\nwant: %v", tc.text, got, tc.want)
 			}
 		})
+	}
+}
+
+// Token 的 Start/End 是原文中的**字节**区间，高亮直接依赖它。
+func TestTokenOffsets(t *testing.T) {
+	a := NewStandardWith(StandardOptions{KeepStopwords: true})
+
+	cases := []struct {
+		name  string
+		text  string
+		terms []string
+		start []int
+		end   []int
+	}{
+		{
+			name:  "简单英文",
+			text:  "Hello, WORLD!",
+			terms: []string{"hello", "world"},
+			start: []int{0, 7},
+			end:   []int{5, 12},
+		},
+		{
+			name:  "前导与连续空白",
+			text:  "  alpha  beta",
+			terms: []string{"alpha", "beta"},
+			start: []int{2, 9},
+			end:   []int{7, 13},
+		},
+		{
+			// 每个汉字 3 字节，偏移必须按字节而不是按字算。
+			name:  "中文逐字",
+			text:  "全文搜索",
+			terms: []string{"全", "文", "搜", "索"},
+			start: []int{0, 3, 6, 9},
+			end:   []int{3, 6, 9, 12},
+		},
+		{
+			name:  "中英混合",
+			text:  "Go语言search",
+			terms: []string{"go", "语", "言", "search"},
+			start: []int{0, 2, 5, 8},
+			end:   []int{2, 5, 8, 14},
+		},
+		{
+			// 撇号被并入词条，因此 End 应落在 t 之后。
+			name:  "词内撇号",
+			text:  "don't stop",
+			terms: []string{"don't", "stop"},
+			start: []int{0, 6},
+			end:   []int{5, 10},
+		},
+		{
+			// 全角字符 3 字节，折叠后词条变短，但区间仍是原文的。
+			name:  "全角折叠",
+			text:  "ＡＢ ＣＤ",
+			terms: []string{"ab", "cd"},
+			start: []int{0, 7},
+			end:   []int{6, 13},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tokens := a.Analyze(tc.text)
+
+			if len(tokens) != len(tc.terms) {
+				t.Fatalf("token 数 = %d, want %d: %+v", len(tokens), len(tc.terms), tokens)
+			}
+			for i, tok := range tokens {
+				if tok.Term != tc.terms[i] {
+					t.Errorf("tokens[%d].Term = %q, want %q", i, tok.Term, tc.terms[i])
+				}
+				if tok.Start != tc.start[i] || tok.End != tc.end[i] {
+					t.Errorf("tokens[%d] 区间 = [%d,%d), want [%d,%d)",
+						i, tok.Start, tok.End, tc.start[i], tc.end[i])
+				}
+			}
+		})
+	}
+}
+
+// 强不变式：text[Start:End] 恰好就是该词条在原文中的位置。
+//
+// 判定方式是把它单独再分析一遍——必须还原出同一个词条。
+// 这条性质一旦破坏，高亮就会错位，而且错得很隐蔽。
+func TestTokenOffsetsRoundTrip(t *testing.T) {
+	a := NewStandardWith(StandardOptions{KeepStopwords: true})
+
+	texts := []string{
+		"Hello, WORLD! 全文 search don't stop",
+		"  mixed　全角ＡＢ and 中文，加标点。",
+		"Go语言search2024年12月",
+		"it's a well-known state-of-the-art design",
+	}
+
+	for _, text := range texts {
+		for _, tok := range a.Analyze(text) {
+			raw := text[tok.Start:tok.End]
+
+			again := a.Analyze(raw)
+			if len(again) != 1 {
+				t.Errorf("text[%d:%d] = %q 单独分析得到 %d 个 token，want 1",
+					tok.Start, tok.End, raw, len(again))
+				continue
+			}
+			if again[0].Term != tok.Term {
+				t.Errorf("text[%d:%d] = %q 还原出 %q，want %q",
+					tok.Start, tok.End, raw, again[0].Term, tok.Term)
+			}
+		}
 	}
 }
 
@@ -108,7 +234,7 @@ func TestStandardOptions(t *testing.T) {
 	t.Run("默认过滤停用词", func(t *testing.T) {
 		got := NewStandard().Analyze("the bar")
 		want := []Token{tk("bar", 1)}
-		if !slices.Equal(got, want) {
+		if !sameTerms(got, want) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})
@@ -117,7 +243,7 @@ func TestStandardOptions(t *testing.T) {
 		a := NewStandardWith(StandardOptions{KeepStopwords: true})
 		got := a.Analyze("the bar")
 		want := []Token{tk("the", 0), tk("bar", 1)}
-		if !slices.Equal(got, want) {
+		if !sameTerms(got, want) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})
@@ -127,7 +253,7 @@ func TestStandardOptions(t *testing.T) {
 		got := a.Analyze("foo the bar")
 		// "the" 不在自定义表里，因此被保留。
 		want := []Token{tk("the", 1), tk("bar", 2)}
-		if !slices.Equal(got, want) {
+		if !sameTerms(got, want) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})
@@ -136,7 +262,7 @@ func TestStandardOptions(t *testing.T) {
 		a := NewStandardWith(StandardOptions{Stopwords: []string{}})
 		got := a.Analyze("the bar")
 		want := []Token{tk("the", 0), tk("bar", 1)}
-		if !slices.Equal(got, want) {
+		if !sameTerms(got, want) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})
@@ -145,7 +271,7 @@ func TestStandardOptions(t *testing.T) {
 		a := NewStandardWith(StandardOptions{MinTokenLen: 1, KeepStopwords: true})
 		got := a.Analyze("a bb")
 		want := []Token{tk("a", 0), tk("bb", 1)}
-		if !slices.Equal(got, want) {
+		if !sameTerms(got, want) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})
@@ -155,7 +281,7 @@ func TestStandardOptions(t *testing.T) {
 		a := NewStandardWith(StandardOptions{Stopwords: []string{"THE", "Don\u2019t"}})
 		got := a.Analyze("the don't keep")
 		want := []Token{tk("keep", 2)}
-		if !slices.Equal(got, want) {
+		if !sameTerms(got, want) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	})

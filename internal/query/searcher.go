@@ -109,6 +109,50 @@ func (s *Searcher) Search(n Node, opts SearchOptions) (Result, error) {
 	return Result{Total: total, Hits: ranked[offset:]}, nil
 }
 
+// QueryTerms 收集语法树里会被**正向匹配**的归一化词条，供高亮使用。
+//
+// 刻意跳过 MustNot 分支：被排除的词条显然不该在结果里高亮。
+//
+// 返回的词条已按索引的分析器归一化，与索引里的形态一致——
+// 直接拿用户输入的原始词去高亮是匹配不上的，例如原文的 "Go" 归一化成 "go"。
+func (s *Searcher) QueryTerms(n Node) []string {
+	var (
+		out  []string
+		seen = make(map[string]struct{})
+	)
+
+	collect := func(text string) {
+		for _, tok := range s.anz.Analyze(text) {
+			if _, dup := seen[tok.Term]; dup {
+				continue
+			}
+			seen[tok.Term] = struct{}{}
+			out = append(out, tok.Term)
+		}
+	}
+
+	var walk func(Node)
+	walk = func(node Node) {
+		switch v := node.(type) {
+		case *Term:
+			collect(v.Text)
+		case *Phrase:
+			collect(v.Raw)
+		case *Bool:
+			for _, c := range v.Must {
+				walk(c)
+			}
+			for _, c := range v.Should {
+				walk(c)
+			}
+			// MustNot 刻意跳过。
+		}
+	}
+
+	walk(n)
+	return out
+}
+
 func clampLimit(n int) int {
 	switch {
 	case n <= 0:

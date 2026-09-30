@@ -2,8 +2,8 @@
 
 用 Go 从零实现的全文搜索服务：**单二进制、零第三方依赖、内存倒排索引、HTTP JSON API**。
 
-> 当前进度：**Phase 3（查询与打分）已完成**，下一步 Phase 4（HTTP 接口）。
-> 10 万篇规模下检索 P99 < 20ms；`make check` 含 `-race` 全绿。
+> 当前进度：**Phase 4（HTTP 接口）已完成**，下一步 Phase 5（工程化交付）。
+> 10 万篇规模下检索 P99 < 20ms；`make check`（含 `-race`）全绿。
 > 完整的项目规划、选型理由与分阶段 TODO 见 [PLAN.md](PLAN.md)。
 
 ## 特性（目标）
@@ -56,21 +56,84 @@ curl.exe --noproxy "*" http://127.0.0.1:8080/api/v1/stats
 
 ## HTTP 接口
 
-| 方法 | 路径 | 状态 |
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/healthz` | ✅ 已实现 |
-| `GET` | `/api/v1/stats` | ✅ 已实现 |
-| `POST` | `/api/v1/documents` | ⬜ Phase 4 |
-| `PUT` | `/api/v1/documents/{id}` | ⬜ Phase 4 |
-| `DELETE` | `/api/v1/documents/{id}` | ⬜ Phase 4 |
-| `GET` | `/api/v1/documents/{id}` | ⬜ Phase 4 |
-| `GET` | `/api/v1/search` | ⬜ Phase 4 |
+| `GET` | `/healthz` | 存活探针 |
+| `GET` | `/api/v1/stats` | 索引规模统计 |
+| `POST` | `/api/v1/documents` | 新建文档，**已存在返回 409** |
+| `PUT` | `/api/v1/documents/{id}` | 覆盖式写入：新建 201 / 覆盖 200 |
+| `GET` | `/api/v1/documents/{id}` | 取原文 |
+| `DELETE` | `/api/v1/documents/{id}` | 删除，成功返回 204 |
+| `GET` | `/api/v1/search` | 检索 |
 
-失败响应统一为：
+### 写入文档
+
+```powershell
+curl.exe --noproxy "*" -X POST http://127.0.0.1:8080/api/v1/documents `
+  -H "Content-Type: application/json" `
+  --data-binary "@doc.json"    # 见下方「为什么用文件传 body」
+```
+
+```json
+{ "id": "doc-1", "fields": { "title": "Inverted index", "body": "..." } }
+```
+
+`POST` 与 `PUT` 的语义**刻意分开**：`POST` 撞 ID 返回 `409`，
+让「不小心覆盖了别人的文档」变成一个明确的错误；
+`PUT` 才是覆盖语义，且是**整体替换**——旧版本独有的词条会被完整摘除。
+
+未知字段（例如把 `fields` 拼成 `field`）会返回 `400`，
+而不是静默忽略后写入一篇空文档。
+
+### 检索
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `q` | 必填 | 查询串 |
+| `limit` | 10 | 返回条数，上限 100 |
+| `offset` | 0 | 跳过条数 |
+| `field` | 全部 | 限定字段，**可重复出现** |
+| `highlight` | false | 是否返回高亮片段，只接受 `true/false/1/0` |
+
+查询语法：`quick brown`（默认 OR）、`"inverted index"`（短语）、
+`-excluded` 或 `NOT excluded`、`a AND b`、`(a OR b) AND c`。
+
+```json
+{
+  "took_ms": 0,
+  "total": 2,
+  "hits": [
+    {
+      "id": "doc-1",
+      "score": 2.81,
+      "fields": { "title": "Inverted index" },
+      "highlights": { "title": "\u003cem\u003eInverted\u003c/em\u003e index" }
+    }
+  ]
+}
+```
+
+> **注意 `highlights` 里的 `\u003c`**：这是 Go `encoding/json` 的默认行为，
+> 它会把 `<` `>` `&` 转义掉。JSON 解析后拿到的就是正常的 `<em>`。
+> 这是**刻意保留**的：文档字段内容由调用方提供，
+> 不转义的话，把响应直接嵌进 HTML 页面就会变成 XSS 入口。
+
+### 错误响应
+
+统一为：
 
 ```json
 { "error": { "code": "INVALID_QUERY", "message": "..." } }
 ```
+
+| 状态码 | `code` | 场景 |
+| --- | --- | --- |
+| 400 | `BAD_REQUEST` | 请求体非法、参数非整数、字段数或 token 数超限 |
+| 400 | `INVALID_QUERY` | 查询串为空或语法错误 |
+| 404 | `NOT_FOUND` | 文档不存在 |
+| 409 | `CONFLICT` | `POST` 的 ID 已存在 |
+| 413 | `PAYLOAD_TOO_LARGE` | 请求体超过上限 |
+| 500 | `INTERNAL` | 服务端故障（细节只记日志，不外泄） |
 
 ## 开发
 
@@ -85,19 +148,50 @@ make check
 ## 代码结构
 
 ```
-cmd/tshd/          # 守护进程入口：配置装配、日志、优雅关闭
-internal/config/   # 配置解析（flag + env）
-internal/httpapi/  # HTTP 路由、中间件、DTO、错误映射
-internal/analyzer/ # 文本分析 ✅ StandardAnalyzer + 内置停用词表
-internal/index/    # 倒排索引 ✅ InvertedIndex + posting list
-internal/query/    # 查询 AST 与解析（Phase 3）
-internal/scoring/  # BM25 与 Top-K（Phase 3）
-pkg/tsh/           # 对外门面 Engine
+cmd/tshd/           # 守护进程入口：配置装配、日志、优雅关闭
+internal/config/    # 配置解析（flag + env）
+internal/httpapi/   # HTTP 路由、中间件、DTO、错误映射 ✅ 全部端点
+internal/analyzer/  # 文本分析 ✅ StandardAnalyzer + 内置停用词表
+internal/index/     # 倒排索引 ✅ InvertedIndex + View / PostingCursor
+internal/query/     # 查询 AST、解析器与执行器（归并求值 + BM25）✅
+internal/scoring/   # BM25 与 Top-K ✅
+internal/highlight/ # 高亮片段（HTML 转义 + 窗口截断）✅
+pkg/tsh/            # 对外门面 Engine ✅ 文档读写 + 检索
 ```
 
 依赖方向单向向内：`httpapi → tsh → {analyzer, query, index, scoring}`。
 
 ## 故障排查
+
+### 为什么用文件传 body：PowerShell 会吃掉 JSON 里的双引号
+
+在 Windows PowerShell 5.1 里这样调 curl 是不行的：
+
+```powershell
+curl.exe -d '{"id":"doc-1"}' http://127.0.0.1:8080/api/v1/documents
+# 服务端收到的是 {id:doc-1} —— 双引号没了
+# → BAD_REQUEST: invalid character 'i' looking for beginning of object key string
+```
+
+PowerShell 把参数拼成命令行时会剥掉内嵌的双引号，这是它调用原生命令的经典缺陷。
+绕开的方式是写进文件再让 curl 读：
+
+```powershell
+Set-Content -Path doc.json -Value '{"id":"doc-1","fields":{"title":"..."}}' -Encoding ascii -NoNewline
+curl.exe --noproxy "*" -X POST -H "Content-Type: application/json" `
+  --data-binary "@doc.json" http://127.0.0.1:8080/api/v1/documents
+```
+
+用 `-Encoding ascii`（或 UTF-8 无 BOM）很重要：PS 5.1 的 `-Encoding UTF8`
+会写入 BOM，服务端会把它当成 JSON 的第一个字符而报错。
+
+### 不要把 PowerShell 函数命名为 `Curl`
+
+PowerShell 的命令解析优先级是 **Alias > Function > Cmdlet > Application**，
+而 `curl` 是 `Invoke-WebRequest` 的内置别名。定义一个叫 `Curl` 的函数会被别名截胡，
+报出莫名其妙的 `Invoke-WebRequest: A positional parameter cannot be found`。
+
+要么换个函数名，要么始终写 `curl.exe`（带扩展名可以绕过别名）。
 
 ### `workspace-write` 沙箱初始化失败：`SetNamedSecurityInfoW failed (Win32 5)`
 

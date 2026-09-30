@@ -570,16 +570,48 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 >   并淹没真正的热点。改为包级 `sync.Once` 只建一次。
 > - 后来直接在 10 万篇上测量，而不是从 2 万篇外推。
 
-### Phase 4 — HTTP 服务
-- [ ] `net/http` + Go 1.22 `ServeMux` 路由注册
-- [ ] 中间件链：`recover` → 请求日志（`slog`）→ 超时 → body 大小限制 → CORS（可选）
-- [ ] 各端点 handler + 请求体校验（`json.Decoder` + `DisallowUnknownFields`）
-- [ ] 统一错误响应与状态码映射
-- [ ] 优雅关闭（`signal.NotifyContext` + `srv.Shutdown`）
-- [ ] `/healthz`、`/api/v1/stats`
-- [ ] `httptest` 端到端测试：写入→查询→更新→查询→删除→查不到
-- [ ] 限流/并发上限保护（`semaphore` 或 `http.MaxBytesReader`）
-- [ ] **验收**：`curl` 走通 README 中的完整示例
+### Phase 4 — HTTP 服务 ✅ 已完成
+
+> **与原计划的偏差**
+> - **`POST` 与 `PUT` 语义分开**：原计划两者都写进同一张表，但没区分语义。
+>   现在 `POST` 撞 ID 返回 **409**，`PUT` 才是覆盖（新建 201 / 覆盖 200）。
+>   理由是「不小心覆盖了别人的文档」应当是一个明确的错误，而不是无声无息。
+>   为此给索引补了 `Add`（仅新建，检查与写入在同一把写锁内，无 TOCTOU 窗口）。
+> - **高亮单独成包**：`internal/highlight`。为了让高亮能定位原文区间，
+>   给 `analyzer.Token` 加了 `Start`/`End` 字节偏移，并把分析器从
+>   `[]rune` 转换改成**字节游标**——既省掉一次分配（实测快 5–11%），
+>   又让偏移天然可得。
+> - **`Engine.Search` 把高亮挪到 `View` 之外**：`View` 持有索引读锁，
+>   在其中遍历整段原文会把写请求全堵住。
+> - **`highlights` 里的 `<` 会被 JSON 转义成 `\u003c`**，这是 Go
+>   `encoding/json` 的默认行为，**刻意保留**：字段内容由调用方提供，
+>   不转义的话把响应嵌进 HTML 就是 XSS 入口。客户端 `JSON.parse` 后拿到的是正常的 `<em>`。
+
+- [x] `net/http` + Go 1.22 `ServeMux` 路由注册（含 `{id}` 路径参数）
+- [x] 中间件链：`recover` → 请求日志（`slog`）→ `MaxBytesReader` body 限制
+- [x] 各端点 handler + 请求体校验（`json.Decoder` + `DisallowUnknownFields`）
+- [x] 统一错误响应与状态码映射（`writeMappedError`）
+- [x] 优雅关闭（`signal.NotifyContext` + `srv.Shutdown`，Phase 0 已就位）
+- [x] `/healthz`、`/api/v1/stats`
+- [x] `httptest` 端到端测试：写入→查询→更新→查询→删除→查不到
+- [x] 请求体上限保护（`http.MaxBytesReader` → 413）
+- [x] **验收**：`curl` 走通完整示例（真实进程冒烟测试通过）
+
+> **两个值得记下来的坑**
+>
+> **① `%v` 包装错误会丢掉具体类型。**
+> `decodeJSON` 最初写 `fmt.Errorf("%w: %v", errBadBody, err)`，
+> 把 `*http.MaxBytesError` 格式化成字符串，于是超限请求体再也识别不出来，
+> 被误报成 400 而不是 413。改用 `%w: %w` 才能同时被 `errors.Is` 与
+> `errors.As` 认出来。**并且 `MaxBytesError` 的判断必须排在 `errBadBody` 之前**，
+> 否则解码错误会先把「太大」误判成「格式不对」。
+>
+> **② `switch` 的分支不写 `return` 会继续往下走。**
+> `writeMappedError` 的 switch 每个 case 都调用了 `writeError` 但没 `return`，
+> 结果写完 404 之后又走到末尾写了第二次 500 —— 响应被写两遍。
+> Go 的 `switch` 不像 C 需要 `break`，但**不会自动返回**。
+
+### Phase 5 — 工程化与交付
 
 ### Phase 5 — 工程化与交付
 - [ ] `README.md`：项目简介、架构图、快速开始、API 文档、curl 示例、性能数据

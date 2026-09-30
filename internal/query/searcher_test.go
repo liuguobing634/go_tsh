@@ -587,6 +587,41 @@ func TestSearchTieBreakIsDeterministic(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- 高亮词条
+
+func TestQueryTerms(t *testing.T) {
+	s := NewSearcher(index.New(index.Options{Analyzer: keepAll()}), scoring.BM25{})
+
+	cases := []struct {
+		name string
+		q    string
+		want []string
+	}{
+		{"归一化", "Hello", []string{"hello"}},
+		{"去重", "go Go GO", []string{"go"}},
+		{"短语拆成词条", `"quick brown"`, []string{"quick", "brown"}},
+		{"跳过被排除的词条", "keep -drop", []string{"keep"}},
+		{"只有排除时没有正向词条", "-drop", nil},
+		{"布尔与括号", "(a OR b) AND c", []string{"a", "b", "c"}},
+		{"NOT 也被跳过", "find NOT hidden", []string{"find"}},
+		{"纯标点不产生词条", "...", nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node, err := Parse(tc.q, Options{})
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.q, err)
+			}
+
+			got := s.QueryTerms(node)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("QueryTerms(%q) = %v, want %v", tc.q, got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------- 基准测试
 
 const benchDocs = 20_000
