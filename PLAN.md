@@ -294,6 +294,7 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 > - **本项目零第三方依赖，因此 GOPROXY 是否可达不影响构建**（已实测外网代理在非交互 shell 下不可验证，可忽略）
 > - Shell 实为 **Windows PowerShell 5.1**（`PSEdition=Desktop`，并非 pwsh 7）：`Console.OutputEncoding=utf-8` 但 `InputEncoding=gb2312`，**`Get-Content` 默认按 ANSI/GBK 解码**，读 Go 程序输出的 UTF-8 日志会乱码（实测 `服务启动` 显示为 `鏈嶅姟鍚姩`），必须显式 `Get-Content -Encoding utf8`；日志文件本身的字节是正确的 UTF-8（`e6 9c 8d e5 8a a1 ...`）
 > - ⚠️ **`-race` 在本机不可用**：`CGO_ENABLED=0` 且宿主无任何 C 编译器（gcc / clang / tcc 均未找到，`GOENV` 文件不存在）。竞态检测依赖 cgo，没有它就完全跑不了
+> - **`.ps1` 脚本必须保持纯 ASCII**：PS 5.1 会把**无 BOM** 的 UTF-8 脚本按 GBK 解析，中文字符被打碎后直接破坏语法（实测 `scripts/check.ps1` 最初含中文注释时报 `Unexpected token '}'`）。本项目约定所有 `.ps1` 只用 ASCII；「保存为带 BOM 的 UTF-8」方案已否决，因为后续任何一次编辑都可能把 BOM 丢掉，属于隐形定时炸弹
 > - 沙箱：`workspace-write` 模式至今仍初始化失败，见下方遗留阻塞
 
 - [x] 确认 Go 工具链 → `D:\Program Files\Go\bin\go.exe`，`go1.27.1`
