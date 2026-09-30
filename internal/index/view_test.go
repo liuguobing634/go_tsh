@@ -2,6 +2,7 @@ package index
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"testing"
 )
@@ -158,6 +159,138 @@ func TestViewReleasesLock(t *testing.T) {
 	if got := ix.DocCount(); got != 2 {
 		t.Errorf("DocCount = %d, want 2", got)
 	}
+}
+
+// ---------------------------------------------------------------- 游标
+
+func TestViewPostingFor(t *testing.T) {
+	ix := newTestIndex(t)
+	if _, err := ix.Add("d1", map[string]string{"body": "go go now go"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ix.Add("d2", map[string]string{"body": "go"}); err != nil {
+		t.Fatal(err)
+	}
+
+	d1 := docIDOf(t, ix, "d1")
+
+	ix.View(func(v *View) {
+		tf, positions, ok := v.PostingFor("body", "go", d1)
+		if !ok {
+			t.Fatal("d1 应当含有 go")
+		}
+		if tf != 3 {
+			t.Errorf("TF = %d, want 3", tf)
+		}
+		if want := []uint32{0, 1, 3}; !slices.Equal(positions, want) {
+			t.Errorf("Positions = %v, want %v", positions, want)
+		}
+
+		if _, _, ok := v.PostingFor("body", "nope", d1); ok {
+			t.Error("不存在的词条应返回 ok=false")
+		}
+		if _, _, ok := v.PostingFor("body", "go", DocID(9999)); ok {
+			t.Error("不存在的文档应返回 ok=false")
+		}
+		if _, _, ok := v.PostingFor("missing", "go", d1); ok {
+			t.Error("不存在的字段应返回 ok=false")
+		}
+	})
+}
+
+func TestViewCursor(t *testing.T) {
+	ix := newTestIndex(t)
+	for i := 0; i < 5; i++ {
+		if _, err := ix.Add(fmt.Sprintf("d%d", i), map[string]string{"body": "common token"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ix.View(func(v *View) {
+		var ids []DocID
+		c := v.Cursor("body", "common")
+		for !c.Done() {
+			ids = append(ids, c.DocID())
+			if c.TF() != 1 {
+				t.Errorf("TF = %d, want 1", c.TF())
+			}
+			c.Next()
+		}
+		if len(ids) != 5 {
+			t.Fatalf("游标遍历 %d 条，want 5", len(ids))
+		}
+		assertSorted(t, postingsFromIDs(ids))
+	})
+
+	// 空游标：不存在的词条不应 panic。
+	ix.View(func(v *View) {
+		c := v.Cursor("body", "nope")
+		if !c.Done() {
+			t.Error("不存在的词条应返回已结束的游标")
+		}
+		if c.DocID() != InvalidDocID || c.TF() != 0 || c.Positions() != nil {
+			t.Error("越界游标的取值应全部为零值")
+		}
+		c.Next()
+	})
+}
+
+func TestViewCursorSeekIsMonotonic(t *testing.T) {
+	ix := newTestIndex(t)
+	const n = 20
+	for i := 0; i < n; i++ {
+		if _, err := ix.Add(fmt.Sprintf("d%02d", i), map[string]string{"body": "common"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ix.View(func(v *View) {
+		c := v.Cursor("body", "common")
+
+		// 取出全部 DocID 作为参照。
+		var all []DocID
+		for probe := v.Cursor("body", "common"); !probe.Done(); probe.Next() {
+			all = append(all, probe.DocID())
+		}
+
+		// 按递增顺序 Seek 每一个，应当逐个命中。
+		for _, want := range all {
+			if !c.Seek(want) {
+				t.Fatalf("Seek(%d) 应命中", want)
+			}
+			if c.DocID() != want {
+				t.Fatalf("Seek(%d) 停在 %d", want, c.DocID())
+			}
+		}
+
+		// 已经走到末尾，再 Seek 一个更大的值应当返回 false 且不回退。
+		if c.Seek(DocID(9999)) {
+			t.Error("越过末尾的 Seek 应返回 false")
+		}
+		if !c.Done() {
+			t.Errorf("Seek 越界后游标应处于结束状态，实际停在 %d", c.DocID())
+		}
+	})
+}
+
+// docIDOf 按外部 ID 取内部 DocID。
+func docIDOf(t *testing.T, ix *InvertedIndex, external string) DocID {
+	t.Helper()
+
+	d, ok := ix.Get(external)
+	if !ok {
+		t.Fatalf("文档 %q 不存在", external)
+	}
+	return d.ID
+}
+
+// postingsFromIDs 把 DocID 列表包成 Posting 切片，便于复用 assertSorted。
+func postingsFromIDs(ids []DocID) []Posting {
+	out := make([]Posting, len(ids))
+	for i, id := range ids {
+		out[i] = Posting{DocID: id}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------- 基准测试

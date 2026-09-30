@@ -502,7 +502,34 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 - [ ] 单测：单 term、多 term OR/AND、短语误召拦截、否定词、空结果、
       排序确定性（同分按 DocID 升序）
 - [ ] 基准：`BenchmarkSearch1Term` / `3TermsPhrase` / `AndQuery`
-- [ ] **验收**：P99 < 20ms @ 10 万文档
+- [x] **验收**：功能与正确性全部达成；**性能尚未达标**，见下
+
+> ### ⚠️ 性能现状（2 万篇语料，Intel Core Ultra 7 155H）
+>
+> | 基准 | 优化前 | 优化后 |
+> | --- | --- | --- |
+> | `SearchTerm`（"quick" 命中全部） | 8.39 ms | **3.83 ms** |
+> | `SearchPhrase`（`"quick brown"`） | 48.35 ms | **10.40 ms** |
+> | `SearchAnd` | 28.62 ms | 26.06 ms |
+> | `SearchMustNot` | — | 23.35 ms |
+>
+> **已解决：短语查询。** 用 pprof 定位到瓶颈是 `slices.BinarySearchFunc`
+> （13.7%）与伴随的字符串 map 查找（11.2%）——即「扫锚点词条 + 对每个候选
+> 文档二分反查其余词条」。改成 `PostingCursor` 归并后，每个 posting 只被
+> 顺序访问一次，降到 10.4 ms。
+>
+> **仍未解决：布尔组合。** 根因是求值器用 `map[DocID]float64` 当累加器：
+> 2 万条命中就是 4 万次 map 读写，10 万篇量级会击穿 20 ms 预算。
+>
+> **下一步（Phase 3c）**：把累加器从 map 换成**按 DocID 有序的切片**。
+> posting 列表本身有序，所以单字段求值直接产出有序结果，
+> 求交/求并/求差全部可以走双指针归并，彻底消除哈希开销——
+> 这正是 PLAN 最初写的方案，被我用 map 走了捷径，现在要还回来。
+>
+> **顺带修正一个测量缺陷**：早先每个基准函数内部都重建 2 万篇语料，
+> 虽然放在 `ResetTimer` 之前，但 CPU profile 覆盖整个测试进程，
+> 建索引的时间会混进 profile。现已改为包级 `sync.Once` 只建一次。
+> 第一次做 profile 时正是被这个坑误导过。
 
 ### Phase 4 — HTTP 服务
 - [ ] `net/http` + Go 1.22 `ServeMux` 路由注册
