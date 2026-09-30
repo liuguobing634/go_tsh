@@ -390,8 +390,12 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
       **故意制造数据竞争**的临时探针（绕过锁读内部 map）验证，
       确认 `go test -race` 报出 `WARNING: DATA RACE` 且退出码非 0；
       删除探针后全绿。**工具本身必须先被验证过，才能用它来验证别的东西。**
-- [ ] **遗留项｜PATH**：把 `D:\Program Files\Go\bin` 加入用户 PATH（当前靠脚本绝对路径兜底，不影响开发）
-- [ ] **遗留项｜换行符**：`git` 提示 LF→CRLF 转换，已加 `.gitattributes`，需 `git add --renormalize .` 落地
+- [ ] **遗留项｜PATH**：`D:\Program Files\Go\bin` 仍未加入用户 PATH。
+      不影响开发与 CI：`check.ps1` 支持 `-GoExe` 传绝对路径，
+      `Makefile` 也有可覆盖的 `GO` 变量。纯属便利性问题
+      （顺带一提，MSYS2 的 `C:\msys64\ucrt64\bin` 已加入，见「遗留阻塞 2」）
+- [x] **遗留项｜换行符**：`.gitattributes` 统一为 LF，并已执行
+      `git add --renormalize .` 落地；后续提交不再出现 LF→CRLF 警告
 
 ### Phase 1 — 文本分析器 ✅ 已完成（commit 1761d7d + 5a8a064）
 
@@ -479,7 +483,11 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 >   都深拷贝 `Positions`，1 万条就是 1 万次分配。一次 3 词查询光拷贝约 2ms/万篇，
 >   10 万篇量级将直接击穿「P99 < 20ms」预算。方案见 Phase 3 开头的零拷贝改造。
 
-### Phase 3 — 查询与打分
+### Phase 3 — 查询与打分 ✅ 已完成
+
+> 分三次提交完成：`37217ad`（零拷贝 View + BM25 + TopK + 解析器）、
+> `f1ee74e`（Searcher 执行器 + 短语游标归并）、
+> `a2cc3c6`（有序切片归并 + 稠密词长切片，达成验收线）。
 > ⚠️ **首要任务：先解决 `Postings()` 的拷贝开销，再写打分逻辑。**
 > Phase 2 的基准已经量化了这个问题（0.7ms / 400KB / 1 万次分配，见上）。
 > 路线是新增零拷贝迭代接口，让整次检索在一次读锁内完成：
@@ -515,16 +523,18 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
       转义引号；子句数上限（默认 64，短语按单词数计入）防查询串打爆内存
 - [x] **解析器不做分词**：只产出语法树，原始文本原样保留。
       分词由执行阶段用索引自己的 Analyzer 完成，从根本上杜绝两侧归一化不一致
-- [ ] **query 与 index 共用同一 Analyzer**（用 `Index().Analyzer()` 取）
-- [ ] posting list 归并：有序求交、求并（双指针）
-- [ ] 短语查询：**必须在单个字段内**判定位置连续性——各字段位置都从 0 开始，
-      跨字段拼位置会产生假阳性
-- [ ] BM25：`IDF = ln(1 + (N-df+0.5)/(df+0.5))`，`tf` 饱和项，`k1=1.2 b=0.75`；
-      **IDF 必须按字段计算**，否则短字段的高信息量会被长字段稀释
-- [ ] 跨字段检索：分别求值再把分数相加
-- [ ] Top-K 小顶堆（`container/heap`）
-- [ ] 高亮片段生成（窗口截取 + `<em>` 包裹，需 HTML 转义）
-- [ ] 单测：单 term、多 term OR/AND、短语误召拦截、否定词、空结果、
+- [x] **query 与 index 共用同一 Analyzer**（`NewSearcher` 内部取 `ix.Analyzer()`，
+      调用方无从传入别的分析器；并有 `TestSearchReusesIndexAnalyzer` 守着）
+- [x] posting list 归并：**有序切片 + 双指针**（求交 / 求并 / 求差全部 O(n)，
+      无哈希；这正是把 `map[DocID]float64` 累加器换掉之后的结果）
+- [x] 短语查询：**必须在单个字段内**判定位置连续性——各字段位置都从 0 开始，
+      跨字段拼位置会产生假阳性（`TestPhraseMustMatchWithinOneField`）
+- [x] BM25：`IDF = ln(1 + (N-df+0.5)/(df+0.5))`，`tf` 饱和项，`k1=1.2 b=0.75`；
+      **IDF 按字段计算**，否则短字段的高信息量会被长字段稀释
+- [x] 跨字段检索：分别求值再把分数相加
+- [x] Top-K 小顶堆（手写小顶堆，避开 `container/heap` 的 `any` 断言）
+- [x] 高亮片段生成（独立成 `internal/highlight`，HTML 转义 + 窗口截断）
+- [x] 单测：单 term、多 term OR/AND、短语误召拦截、否定词、空结果、
       排序确定性（同分按 DocID 升序）
 - [x] 基准：`BenchmarkSearch*`（2 万篇）与 `BenchmarkSearch100k*`（验收规模）
 - [x] **验收**：功能、正确性、**性能全部达成**，见下
