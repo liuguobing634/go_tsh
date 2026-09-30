@@ -81,6 +81,28 @@ function Test-UsableDirectory {
     }
 }
 
+# Locate a C compiler for the race detector.
+#
+# On Windows the usual source is MSYS2, whose toolchain lives outside the
+# default PATH (the MSYS2 shell sets it up itself). Probe for it explicitly
+# rather than depending on the user having configured PATH correctly.
+#
+# Note: only the toolchain bin dir is used. C:\msys64\usr\bin must never go on
+# the Windows PATH - it ships MSYS2's own link.exe / find.exe / sort.exe / sh.exe
+# which shadow the native tools and break unrelated builds.
+function Find-CCompiler {
+    $cmd = Get-Command gcc -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    foreach ($root in @('C:\msys64', 'D:\msys64', 'C:\msys32', 'D:\msys32')) {
+        foreach ($variant in 'ucrt64', 'mingw64', 'clang64', 'mingw32') {
+            $exe = Join-Path $root "$variant\bin\gcc.exe"
+            if (Test-Path $exe) { return $exe }
+        }
+    }
+    return $null
+}
+
 # Fail fast with a readable message when go itself is missing.
 $goVersion = $null
 try { $goVersion = (& $GoExe version 2>&1 | Out-String).Trim() } catch { $goVersion = $null }
@@ -129,6 +151,16 @@ Invoke-Checked 'go vet' { & $GoExe vet $Package }
 
 # The race detector needs cgo and a C compiler. Degrade gracefully instead of
 # failing the gate for a purely environmental reason.
+$cc = Find-CCompiler
+if ($cc) {
+    $ccDir = Split-Path -Parent $cc
+    if (($env:PATH -split ';') -notcontains $ccDir) {
+        $env:PATH = $ccDir + ';' + $env:PATH
+        Write-Host "CC -> $cc" -ForegroundColor DarkGray
+    }
+    $env:CGO_ENABLED = '1'
+}
+
 $cgo = (& $GoExe env CGO_ENABLED | Out-String).Trim()
 $hasCC = $null -ne (Get-Command gcc -ErrorAction SilentlyContinue)
 if ($cgo -eq '1' -and $hasCC) {

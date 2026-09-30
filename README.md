@@ -2,7 +2,8 @@
 
 用 Go 从零实现的全文搜索服务：**单二进制、零第三方依赖、内存倒排索引、HTTP JSON API**。
 
-> 当前进度：**Phase 2（倒排索引内核）已完成**，下一步 Phase 3（查询与打分）。
+> 当前进度：**Phase 3（查询与打分）已完成**，下一步 Phase 4（HTTP 接口）。
+> 10 万篇规模下检索 P99 < 20ms；`make check` 含 `-race` 全绿。
 > 完整的项目规划、选型理由与分阶段 TODO 见 [PLAN.md](PLAN.md)。
 
 ## 特性（目标）
@@ -137,11 +138,37 @@ Windows PowerShell 5.1 的 `Get-Content` 默认按 ANSI（简体中文下为 GBK
 该脚本必须保持**纯 ASCII**。PS 5.1 会把无 BOM 的 UTF-8 `.ps1` 按 GBK 解析，
 中文注释被打碎后会直接破坏语法。若要写中文，必须存为 UTF-8 **带 BOM**。
 
-### `SKIP -race (needs cgo + a C compiler)`
+### 启用 `-race`（竞态检测）
 
-竞态检测依赖 cgo。本机 `CGO_ENABLED=0` 且没有 C 编译器，因此
-`check.ps1` 自动降级为普通 `go test` 并明确告警——**不会假装通过**。
-安装 mingw-w64 后设置 `CGO_ENABLED=1` 即可启用。
+竞态检测依赖 cgo，而 Go 在 Windows 上的 cgo 走 MinGW-w64 路线，
+必须是 **GCC 风格**的驱动（官方 LLVM 发布版 target 是 MSVC，**装了对 cgo 没用**）。
+
+推荐用 MSYS2 装 GCC：
+
+```powershell
+# 在 MSYS2 的 UCRT64 shell 里
+pacman -S mingw-w64-ucrt-x86_64-gcc
+```
+
+装好后工具链在 `C:\msys64\ucrt64\bin`。**两个坑**：
+
+1. MSYS2 的工具链**不在 Windows PATH 上**（MSYS2 shell 自己会设），
+   所以 cmd 里敲 `gcc` 无效。需要自己加：
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable('Path',
+       ([Environment]::GetEnvironmentVariable('Path','User').TrimEnd(';') + ';C:\msys64\ucrt64\bin'),
+       'User')
+   ```
+
+2. ⚠️ **绝不能把 `C:\msys64\usr\bin` 加进 PATH**。那里有 MSYS2 自己的
+   `link.exe` / `find.exe` / `sort.exe` / `sh.exe`，会遮蔽 Windows 原生命令
+   并破坏无关的构建。只需加 `ucrt64\bin`（或 `mingw64\bin`）。
+
+`scripts/check.ps1` **会自动探测** `ucrt64` / `mingw64` / `clang64` / `mingw32`
+四个变体目录，找到就临时加进 PATH 并设 `CGO_ENABLED=1`，
+因此项目不依赖你的 PATH 配置。若确实找不到 C 编译器，
+它会自动降级为普通 `go test` 并明确告警——**不会假装通过**。
 
 ### 沙箱内 `go build` 报 `Access is denied`（GOCACHE）
 

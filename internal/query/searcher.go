@@ -20,7 +20,7 @@ type Result struct {
 
 	// Hits 是当前页结果，按「分数降序、同分 DocID 升序」排列。
 	//
-	// 没有这条确定性约定，同分文档的先后会随 map 遍历顺序漂移，
+	// 没有这条确定性约定，同分文档的先后会随内部遍历顺序漂移，
 	// 分页会出现重复或漏项。
 	Hits []Hit
 }
@@ -82,31 +82,31 @@ func (s *Searcher) Search(n Node, opts SearchOptions) (Result, error) {
 	limit := clampLimit(opts.Limit)
 	offset := clampOffset(opts.Offset)
 
-	var scores docScores
+	var hits hitList
 	s.ix.View(func(v *index.View) {
 		fields := resolveFields(v, opts.Fields)
 		if len(fields) == 0 {
 			return
 		}
-		scores = s.eval(v, n, fields)
+		hits = s.eval(v, n, fields)
 	})
 
-	total := len(scores)
+	total := hits.len()
 	if total == 0 {
 		return Result{Total: 0}, nil
 	}
 
 	// 只保留 offset+limit 条：分页不需要对全部命中排序。
 	tk := scoring.NewTopK[index.DocID](offset + limit)
-	for id, score := range scores {
-		tk.Push(id, score)
+	for i, id := range hits.ids {
+		tk.Push(id, hits.scores[i])
 	}
 
-	hits := tk.Result()
-	if offset >= len(hits) {
+	ranked := tk.Result()
+	if offset >= len(ranked) {
 		return Result{Total: total}, nil
 	}
-	return Result{Total: total, Hits: hits[offset:]}, nil
+	return Result{Total: total, Hits: ranked[offset:]}, nil
 }
 
 func clampLimit(n int) int {
@@ -146,16 +146,181 @@ func resolveFields(v *index.View, want []string) []string {
 	return out
 }
 
+// docLenAt 从 View.FieldLens 的稠密切片里取某文档在某字段上的 token 数。
+// 越界（已删除的文档，或该字段尚未覆盖到的 DocID）视为 0。
+func docLenAt(lens []int32, id index.DocID) float64 {
+	if int(id) >= len(lens) {
+		return 0
+	}
+	return float64(lens[id])
+}
+
+// ---------------------------------------------------------------- 命中集合
+
+// hitList 是按 DocID **升序**排列的命中集合，scores 与 ids 一一对应。
+//
+// 为什么不用 map[DocID]float64 当累加器：
+// posting 列表本身就按 DocID 有序，单字段求值天然产出有序结果，
+// 于是求交 / 求并 / 求差全部可以走双指针归并——O(n)、无哈希、顺序访问。
+//
+// 早先图省事用了 map，2 万条命中就是 4 万次 map 读写，
+// `SearchAnd` 实测 26ms，10 万篇量级必然击穿 20ms 预算。
+//
+// 不变量：所有返回 hitList 的求值函数都必须保证 ids 严格升序。
+// 这条不变量是整个归并体系成立的前提。
+type hitList struct {
+	ids    []index.DocID
+	scores []float64
+}
+
+func (h hitList) len() int { return len(h.ids) }
+
+// add 追加一条命中。调用方必须按 DocID 升序追加。
+func (h *hitList) add(id index.DocID, score float64) {
+	h.ids = append(h.ids, id)
+	h.scores = append(h.scores, score)
+}
+
+func newHitList(capacity int) hitList {
+	if capacity < 0 {
+		capacity = 0
+	}
+	return hitList{
+		ids:    make([]index.DocID, 0, capacity),
+		scores: make([]float64, 0, capacity),
+	}
+}
+
+// unionAll 求并集，重复文档的分数相加。输入必须各自有序。
+func unionAll(sets []hitList) hitList {
+	switch len(sets) {
+	case 0:
+		return hitList{}
+	case 1:
+		return sets[0]
+	}
+
+	acc := sets[0]
+	for _, s := range sets[1:] {
+		acc = mergeUnion(acc, s)
+	}
+	return acc
+}
+
+func mergeUnion(a, b hitList) hitList {
+	out := newHitList(a.len() + b.len())
+
+	i, j := 0, 0
+	for i < a.len() && j < b.len() {
+		switch {
+		case a.ids[i] < b.ids[j]:
+			out.add(a.ids[i], a.scores[i])
+			i++
+		case a.ids[i] > b.ids[j]:
+			out.add(b.ids[j], b.scores[j])
+			j++
+		default:
+			out.add(a.ids[i], a.scores[i]+b.scores[j])
+			i++
+			j++
+		}
+	}
+	for ; i < a.len(); i++ {
+		out.add(a.ids[i], a.scores[i])
+	}
+	for ; j < b.len(); j++ {
+		out.add(b.ids[j], b.scores[j])
+	}
+
+	return out
+}
+
+// intersectAll 求交集，命中文档的分数相加。输入必须各自有序。
+func intersectAll(sets []hitList) hitList {
+	switch len(sets) {
+	case 0:
+		return hitList{}
+	case 1:
+		return sets[0]
+	}
+
+	// 从最短的集合开始，尽早把中间结果收敛到空。
+	order := make([]int, len(sets))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortFunc(order, func(x, y int) int {
+		return cmp.Compare(sets[x].len(), sets[y].len())
+	})
+
+	acc := sets[order[0]]
+	for _, i := range order[1:] {
+		acc = mergeIntersect(acc, sets[i])
+		if acc.len() == 0 {
+			break
+		}
+	}
+	return acc
+}
+
+func mergeIntersect(a, b hitList) hitList {
+	out := newHitList(min(a.len(), b.len()))
+
+	i, j := 0, 0
+	for i < a.len() && j < b.len() {
+		switch {
+		case a.ids[i] < b.ids[j]:
+			i++
+		case a.ids[i] > b.ids[j]:
+			j++
+		default:
+			out.add(a.ids[i], a.scores[i]+b.scores[j])
+			i++
+			j++
+		}
+	}
+	return out
+}
+
+// subtract 返回 a 中不在 b 里的文档。两者都必须有序。
+func subtract(a, b hitList) hitList {
+	out := newHitList(a.len())
+
+	j := 0
+	for i := 0; i < a.len(); i++ {
+		for j < b.len() && b.ids[j] < a.ids[i] {
+			j++
+		}
+		if j < b.len() && b.ids[j] == a.ids[i] {
+			continue
+		}
+		out.add(a.ids[i], a.scores[i])
+	}
+	return out
+}
+
+// addExisting 只给 dst 中**已有**的文档加分，不引入新文档。
+// 两者都必须有序。用于「Must 非空时 Should 只加分」。
+func addExisting(dst *hitList, src hitList) {
+	i, j := 0, 0
+	for i < dst.len() && j < src.len() {
+		switch {
+		case dst.ids[i] < src.ids[j]:
+			i++
+		case dst.ids[i] > src.ids[j]:
+			j++
+		default:
+			dst.scores[i] += src.scores[j]
+			i++
+			j++
+		}
+	}
+}
+
 // ---------------------------------------------------------------- 求值
 
-// docScores 是求值结果：出现在 map 里就表示命中，值是 BM25 分数。
-//
-// 用 map 而不是有序 posting 归并，是「先正确、再快」的取舍：
-// 归并需要跨字段维护游标，复杂得多。Phase 5 压测若显示这里是瓶颈，
-// 再换成基于 posting 有序性的双指针归并。
-type docScores map[index.DocID]float64
-
-func (s *Searcher) eval(v *index.View, n Node, fields []string) docScores {
+// eval 求值一个节点。返回的 hitList 保证按 DocID 升序。
+func (s *Searcher) eval(v *index.View, n Node, fields []string) hitList {
 	switch node := n.(type) {
 	case *Term:
 		return s.evalTerm(v, node, fields)
@@ -165,18 +330,18 @@ func (s *Searcher) eval(v *index.View, n Node, fields []string) docScores {
 		return s.evalBool(v, node, fields)
 	default:
 		// 解析器只会产出上面三种节点；走到这里说明有人手工构造了 AST。
-		return nil
+		return hitList{}
 	}
 }
 
 // evalTerm 处理单词条节点。
-func (s *Searcher) evalTerm(v *index.View, t *Term, fields []string) docScores {
+func (s *Searcher) evalTerm(v *index.View, t *Term, fields []string) hitList {
 	tokens := s.anz.Analyze(t.Text)
 
 	switch len(tokens) {
 	case 0:
 		// 整个词被分析器吃掉了（例如只由停用词或过短字符组成）。
-		return nil
+		return hitList{}
 	case 1:
 		return s.evalSingleTerm(v, tokens[0].Term, fields)
 	default:
@@ -187,10 +352,10 @@ func (s *Searcher) evalTerm(v *index.View, t *Term, fields []string) docScores {
 }
 
 // evalPhrase 处理双引号短语。
-func (s *Searcher) evalPhrase(v *index.View, p *Phrase, fields []string) docScores {
+func (s *Searcher) evalPhrase(v *index.View, p *Phrase, fields []string) hitList {
 	tokens := s.anz.Analyze(p.Raw)
 	if len(tokens) == 0 {
-		return nil
+		return hitList{}
 	}
 	return s.evalPhraseTokens(v, tokens, fields)
 }
@@ -200,8 +365,8 @@ func (s *Searcher) evalPhrase(v *index.View, p *Phrase, fields []string) docScor
 // 同一词条出现在多个字段时，各字段的贡献相加。注意每个字段的 IDF
 // 是**分开算**的：同一个词在 title 与 body 里的稀有程度完全不同，
 // 混在一起算会让短字段的高信息量被长字段稀释。
-func (s *Searcher) evalSingleTerm(v *index.View, term string, fields []string) docScores {
-	out := make(docScores)
+func (s *Searcher) evalSingleTerm(v *index.View, term string, fields []string) hitList {
+	var sets []hitList
 
 	for _, field := range fields {
 		fs, ok := v.FieldStats(field)
@@ -216,13 +381,23 @@ func (s *Searcher) evalSingleTerm(v *index.View, term string, fields []string) d
 		idf := s.bm.IDF(df, uint32(fs.Docs))
 		avgLen := fs.AvgLength
 
+		// 把字段维度提到循环外取一次：循环内只剩切片索引，
+		// 不再对每条 posting 做一次随机 map 查找。
+		lens := v.FieldLens(field)
+
+		// posting 有序，因此这里按序追加即得到有序 hitList。
+		hl := newHitList(int(df))
 		v.ScanIDs(field, term, func(id index.DocID, tf uint32) bool {
-			out[id] += s.bm.Score(idf, tf, float64(v.DocLength(id, field)), avgLen)
+			hl.add(id, s.bm.Score(idf, tf, docLenAt(lens, id), avgLen))
 			return true
 		})
+
+		if hl.len() > 0 {
+			sets = append(sets, hl)
+		}
 	}
 
-	return out
+	return unionAll(sets)
 }
 
 // evalPhraseTokens 按「相对位置一致」判定短语命中。
@@ -235,13 +410,13 @@ func (s *Searcher) evalSingleTerm(v *index.View, term string, fields []string) d
 // 关键点二：用**游标归并**而不是「扫锚点 + 逐文档二分反查」。
 // 后者在 2 万篇规模下实测要 48ms（pprof 显示 BinarySearchFunc 占 13.7%、
 // 伴随的字符串 map 查找占 11.2%）。改成归并后每个 posting 只被访问一次，
-// 且是顺序访问。由于所有 posting 列表都按 DocID 有序，归并天然成立。
-func (s *Searcher) evalPhraseTokens(v *index.View, tokens []analyzer.Token, fields []string) docScores {
+// 且是顺序访问。
+func (s *Searcher) evalPhraseTokens(v *index.View, tokens []analyzer.Token, fields []string) hitList {
 	if len(tokens) == 1 {
 		return s.evalSingleTerm(v, tokens[0].Term, fields)
 	}
 
-	out := make(docScores)
+	var sets []hitList
 
 	// 词条下标，按 DF 升序排列：最稀有的做驱动游标，候选文档最少。
 	order := make([]int, len(tokens))
@@ -285,7 +460,9 @@ func (s *Searcher) evalPhraseTokens(v *index.View, tokens []analyzer.Token, fiel
 
 		driver := order[0]
 		avgLen := fs.AvgLength
+		lens := v.FieldLens(field)
 
+		hl := newHitList(int(v.DocFreq(field, tokens[driver].Term)))
 		for !cursors[driver].Done() {
 			id := cursors[driver].DocID()
 
@@ -301,15 +478,19 @@ func (s *Searcher) evalPhraseTokens(v *index.View, tokens []analyzer.Token, fiel
 
 			if all {
 				if n := countPhrase(tokens, cursors, driver); n > 0 {
-					out[id] += s.bm.Score(idf, n, float64(v.DocLength(id, field)), avgLen)
+					hl.add(id, s.bm.Score(idf, n, docLenAt(lens, id), avgLen))
 				}
 			}
 
 			cursors[driver].Next()
 		}
+
+		if hl.len() > 0 {
+			sets = append(sets, hl)
+		}
 	}
 
-	return out
+	return unionAll(sets)
 }
 
 // countPhrase 统计短语出现次数。
@@ -329,6 +510,9 @@ func countPhrase(tokens []analyzer.Token, cursors []index.PostingCursor, anchor 
 }
 
 // phraseFits 判定以 start 为锚点位置时，短语是否整体落在文档里。
+//
+// 注意「整体落在**同一个字段**里」：各字段的位置都从 0 开始，
+// 跨字段拼位置会造出根本不存在的短语。
 func phraseFits(tokens []analyzer.Token, cursors []index.PostingCursor, anchor int, base, start uint32) bool {
 	for i, t := range tokens {
 		if i == anchor {
@@ -365,8 +549,8 @@ func containsPosition(positions []uint32, want uint32) bool {
 }
 
 // evalBool 处理布尔组合。
-func (s *Searcher) evalBool(v *index.View, b *Bool, fields []string) docScores {
-	var must, should, mustNot []docScores
+func (s *Searcher) evalBool(v *index.View, b *Bool, fields []string) hitList {
+	var must, should, mustNot []hitList
 
 	for _, c := range b.Must {
 		must = append(must, s.eval(v, c, fields))
@@ -378,92 +562,30 @@ func (s *Searcher) evalBool(v *index.View, b *Bool, fields []string) docScores {
 		mustNot = append(mustNot, s.eval(v, c, fields))
 	}
 
-	var out docScores
+	var out hitList
 
 	switch {
 	case len(must) > 0:
-		out = intersect(must)
+		out = intersectAll(must)
 		// Must 非空时，Should 只负责加分，不参与筛选。
-		for _, sc := range should {
-			addExisting(out, sc)
-		}
+		addExisting(&out, unionAll(should))
 
 	case len(should) > 0:
-		out = union(should)
+		out = unionAll(should)
 
 	default:
 		// 只有否定子句（例如单独一个 -foo）：只能从全量文档出发再排除。
 		// 这是 O(N) 的，代价随索引规模线性增长。
-		out = make(docScores)
-		v.EachDocument(func(id index.DocID) bool {
-			out[id] = 0
-			return true
-		})
+		ids := v.SortedDocIDs()
+		out = newHitList(len(ids))
+		for _, id := range ids {
+			out.add(id, 0)
+		}
 	}
 
-	for _, neg := range mustNot {
-		for id := range neg {
-			delete(out, id)
-		}
+	if len(mustNot) > 0 {
+		out = subtract(out, unionAll(mustNot))
 	}
 
 	return out
-}
-
-// intersect 求多个分数集合的交集，命中文档的分数相加。
-func intersect(sets []docScores) docScores {
-	if len(sets) == 0 {
-		return nil
-	}
-
-	// 从最小的集合出发，减少比较次数。
-	smallest := 0
-	for i, s := range sets {
-		if len(s) < len(sets[smallest]) {
-			smallest = i
-		}
-	}
-
-	out := make(docScores, len(sets[smallest]))
-	for id, score := range sets[smallest] {
-		total := score
-		matched := true
-
-		for i, other := range sets {
-			if i == smallest {
-				continue
-			}
-			sc, ok := other[id]
-			if !ok {
-				matched = false
-				break
-			}
-			total += sc
-		}
-
-		if matched {
-			out[id] = total
-		}
-	}
-	return out
-}
-
-// union 求多个分数集合的并集，分数相加。
-func union(sets []docScores) docScores {
-	out := make(docScores)
-	for _, s := range sets {
-		for id, score := range s {
-			out[id] += score
-		}
-	}
-	return out
-}
-
-// addExisting 只给 dst 里**已有**的文档加分，不引入新文档。
-func addExisting(dst, src docScores) {
-	for id, score := range src {
-		if _, ok := dst[id]; ok {
-			dst[id] += score
-		}
-	}
 }

@@ -293,7 +293,9 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 > - `GOPATH=C:\Users\liuguobing\go`，`GOPROXY=https://proxy.golang.org,direct`
 > - **本项目零第三方依赖，因此 GOPROXY 是否可达不影响构建**（已实测外网代理在非交互 shell 下不可验证，可忽略）
 > - Shell 实为 **Windows PowerShell 5.1**（`PSEdition=Desktop`，并非 pwsh 7）：`Console.OutputEncoding=utf-8` 但 `InputEncoding=gb2312`，**`Get-Content` 默认按 ANSI/GBK 解码**，读 Go 程序输出的 UTF-8 日志会乱码（实测 `服务启动` 显示为 `鏈嶅姟鍚姩`），必须显式 `Get-Content -Encoding utf8`；日志文件本身的字节是正确的 UTF-8（`e6 9c 8d e5 8a a1 ...`）
-> - ⚠️ **`-race` 在本机不可用**：`CGO_ENABLED=0` 且宿主无任何 C 编译器（gcc / clang / tcc 均未找到，`GOENV` 文件不存在）。竞态检测依赖 cgo，没有它就完全跑不了
+> - ✅ **`-race` 已可用**：原先 `CGO_ENABLED=0` 且宿主无 C 编译器。后经 MSYS2 安装
+>   GCC 16.2.0（`C:\msys64\ucrt64\bin`，target `x86_64-w64-mingw32`）解决。
+>   `scripts/check.ps1` 会自动探测该路径并设置 `CGO_ENABLED=1`，不依赖用户 PATH。
 > - **`.ps1` 脚本必须保持纯 ASCII**：PS 5.1 会把**无 BOM** 的 UTF-8 脚本按 GBK 解析，中文字符被打碎后直接破坏语法（实测 `scripts/check.ps1` 最初含中文注释时报 `Unexpected token '}'`）。本项目约定所有 `.ps1` 只用 ASCII；「保存为带 BOM 的 UTF-8」方案已否决，因为后续任何一次编辑都可能把 BOM 丢掉，属于隐形定时炸弹
 > - ✅ **沙箱问题已定位并修复**：根因是 DSH 沙箱使用的 write-restricted token 会绕过 NTFS「所有者隐式拥有 `WRITE_DAC`」规则，需要一条**显式** FullControl ACE。详见下方「遗留阻塞 1」
 > - 沙箱内 `go` 会警告模块缓存 `C:\Users\liuguobing\go\pkg\mod\cache` 不可写；本项目零依赖，构建与测试不受影响
@@ -364,7 +366,30 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
       `writing stat cache: open C:\Users\liuguobing\go\pkg\mod\cache\...: Access is denied`。
       本项目零依赖，构建与测试均不受影响，属噪音级警告。
       若将来引入第三方依赖，需把 `GOMODCACHE` 同样指向工作区内。
-- [ ] **遗留阻塞 2｜`-race` 不可用**：需安装 mingw-w64 并令 `CGO_ENABLED=1`，或把 `-race` 门禁下沉到 Linux CI。**在解决前，Phase 1 之后的并发安全只能靠人工审查，缺少工具兜底**
+- [x] **遗留阻塞 2｜`-race` 不可用 —— 已解决**
+
+      **根因**：`CGO_ENABLED=0` 且宿主无任何 C 编译器。竞态检测依赖 cgo，
+      而 Go 在 Windows 上的 cgo 走 MinGW-w64 路线，必须是 GCC 风格的驱动。
+
+      **解决**：经 MSYS2 安装 GCC 16.2.0，位于 `C:\msys64\ucrt64\bin`，
+      target 为 `x86_64-w64-mingw32`（UCRT 变体，正是推荐组合）。
+
+      **两个坑**：
+      1. MSYS2 的工具链**不在 Windows PATH 上**（MSYS2 shell 自己会设），
+         所以 cmd 里敲 `gcc` 无效。已把 `C:\msys64\ucrt64\bin` 追加到用户 PATH。
+      2. **绝不能把 `C:\msys64\usr\bin` 加进 PATH**——那里有 MSYS2 自己的
+         `link.exe` / `find.exe` / `sort.exe` / `sh.exe`，会遮蔽原生命令并
+         破坏无关的构建。这是 MSYS2 最经典的陷阱。
+
+      **加固**：`scripts/check.ps1` 会自动探测 MSYS2 的四个变体目录
+      （ucrt64 / mingw64 / clang64 / mingw32），找到就临时加进 PATH 并设
+      `CGO_ENABLED=1`。因此项目**不依赖用户 PATH 是否配置正确**，
+      换机器或 PATH 未刷新时同样能跑。
+
+      **反向验证**：仅"测试通过"不能证明竞态检测真的在工作。用一个
+      **故意制造数据竞争**的临时探针（绕过锁读内部 map）验证，
+      确认 `go test -race` 报出 `WARNING: DATA RACE` 且退出码非 0；
+      删除探针后全绿。**工具本身必须先被验证过，才能用它来验证别的东西。**
 - [ ] **遗留项｜PATH**：把 `D:\Program Files\Go\bin` 加入用户 PATH（当前靠脚本绝对路径兜底，不影响开发）
 - [ ] **遗留项｜换行符**：`git` 提示 LF→CRLF 转换，已加 `.gitattributes`，需 `git add --renormalize .` 落地
 
@@ -501,35 +526,49 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 - [ ] 高亮片段生成（窗口截取 + `<em>` 包裹，需 HTML 转义）
 - [ ] 单测：单 term、多 term OR/AND、短语误召拦截、否定词、空结果、
       排序确定性（同分按 DocID 升序）
-- [ ] 基准：`BenchmarkSearch1Term` / `3TermsPhrase` / `AndQuery`
-- [x] **验收**：功能与正确性全部达成；**性能尚未达标**，见下
+- [x] 基准：`BenchmarkSearch*`（2 万篇）与 `BenchmarkSearch100k*`（验收规模）
+- [x] **验收**：功能、正确性、**性能全部达成**，见下
 
-> ### ⚠️ 性能现状（2 万篇语料，Intel Core Ultra 7 155H）
+> ### ✅ 性能：P99 < 20ms @ 10 万文档 —— 达成
 >
-> | 基准 | 优化前 | 优化后 |
-> | --- | --- | --- |
-> | `SearchTerm`（"quick" 命中全部） | 8.39 ms | **3.83 ms** |
-> | `SearchPhrase`（`"quick brown"`） | 48.35 ms | **10.40 ms** |
-> | `SearchAnd` | 28.62 ms | 26.06 ms |
-> | `SearchMustNot` | — | 23.35 ms |
+> 语料是最坏情况（每个词条都命中全部 10 万篇，df = N）。
 >
-> **已解决：短语查询。** 用 pprof 定位到瓶颈是 `slices.BinarySearchFunc`
-> （13.7%）与伴随的字符串 map 查找（11.2%）——即「扫锚点词条 + 对每个候选
-> 文档二分反查其余词条」。改成 `PostingCursor` 归并后，每个 posting 只被
-> 顺序访问一次，降到 10.4 ms。
+> | 基准（**10 万篇**） | 初版 | 最终 | 提升 |
+> | --- | --- | --- | --- |
+> | `Search100kTerm` | 27.77 ms | **3.48 ms** | 8.0× |
+> | `Search100kPhrase` | 42.46 ms | **12.42 ms** | 3.4× |
+> | `Search100kAnd` | 64.86 ms | **8.10 ms** | 8.0× |
+> | `Search100kMustNot` | 58.07 ms | **4.86 ms** | 12.0× |
 >
-> **仍未解决：布尔组合。** 根因是求值器用 `map[DocID]float64` 当累加器：
-> 2 万条命中就是 4 万次 map 读写，10 万篇量级会击穿 20 ms 预算。
+> `Search100kAnd` 的分配次数从 366 降到 **28**，`Search100kTerm` 从 152 降到 **14**。
 >
-> **下一步（Phase 3c）**：把累加器从 map 换成**按 DocID 有序的切片**。
-> posting 列表本身有序，所以单字段求值直接产出有序结果，
-> 求交/求并/求差全部可以走双指针归并，彻底消除哈希开销——
-> 这正是 PLAN 最初写的方案，被我用 map 走了捷径，现在要还回来。
+> #### 三次优化，每次都由 pprof 指路
 >
-> **顺带修正一个测量缺陷**：早先每个基准函数内部都重建 2 万篇语料，
-> 虽然放在 `ResetTimer` 之前，但 CPU profile 覆盖整个测试进程，
-> 建索引的时间会混进 profile。现已改为包级 `sync.Once` 只建一次。
-> 第一次做 profile 时正是被这个坑误导过。
+> **① 短语查询 48.35 → 10.40 ms。**
+> profile 显示 `slices.BinarySearchFunc` 占 13.7%、`mapaccess2_faststr` 占 11.2%。
+> 根因是「扫锚点词条 + 逐候选文档二分反查其余词条」。改成 `PostingCursor`
+> 归并后每个 posting 只被顺序访问一次。
+>
+> **② 布尔组合 64.86 → 8.10 ms。**
+> 根因是求值器拿 `map[DocID]float64` 当累加器，2 万条命中就是 4 万次 map 读写。
+> 换成**按 DocID 有序的切片** + 双指针归并（求交/求并/求差全部 O(n)）。
+> 这正是 PLAN 最初写的方案，被我用 map 走了捷径，现在还回来了。
+>
+> **③ 词长查询 27.77 → 3.48 ms。**
+> 这条最有意思：2 万 → 10 万篇，数据量只涨 5 倍，耗时却涨了 12 倍——典型的
+> 缓存失效特征。pprof 确认 `docLengthLocked` 占 **37.4%** 累计耗时，
+> 其中约 31% 全花在 map 操作上：它对每条 posting 都要做**两次随机 map 查找**
+> （`ix.docs[id]` 再 `doc.FieldLen[field]`）。
+> 改为按 DocID 稠密下标的 `[]int32` 后，字段维度提到循环外取一次，
+> 循环内只剩一次顺序友好的切片索引。
+> **这里的教训是：不要从 2 万篇线性外推 10 万篇，超线性增长会骗人。**
+>
+> #### 两个测量方法的坑
+>
+> - 早先每个基准函数内部都重建 2 万篇语料，虽在 `ResetTimer` 之前，
+>   但 CPU profile 覆盖**整个测试进程**，建索引的时间会混进 profile
+>   并淹没真正的热点。改为包级 `sync.Once` 只建一次。
+> - 后来直接在 10 万篇上测量，而不是从 2 万篇外推。
 
 ### Phase 4 — HTTP 服务
 - [ ] `net/http` + Go 1.22 `ServeMux` 路由注册

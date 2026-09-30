@@ -661,3 +661,78 @@ func BenchmarkSearchRareTerm(b *testing.B) {
 func BenchmarkSearchMustNot(b *testing.B) {
 	benchSearch(b, "quick -running", Options{}, SearchOptions{Limit: 10})
 }
+
+// ---------------------------------------------------------------- 10 万篇
+
+// benchLargeDocs 与 PLAN 的验收规模对齐。
+const benchLargeDocs = 100_000
+
+var (
+	benchLargeOnce sync.Once
+	benchLargeIdx  *index.InvertedIndex
+)
+
+// benchCorpusLarge 构建 10 万篇语料，用于在真实验收规模上测量，
+// 而不是从 2 万篇线性外推——外推经常是错的。
+func benchCorpusLarge() *index.InvertedIndex {
+	benchLargeOnce.Do(func() {
+		ix := index.New(index.Options{Analyzer: keepAll()})
+		for i := 0; i < benchLargeDocs; i++ {
+			if _, err := ix.Add(fmt.Sprintf("doc-%d", i), map[string]string{
+				"title": "the quick brown fox",
+				"body":  "the quick brown fox jumps over the lazy dog and keeps running",
+			}); err != nil {
+				panic(err)
+			}
+		}
+		benchLargeIdx = ix
+	})
+	return benchLargeIdx
+}
+
+func benchSearchLarge(b *testing.B, q string, opts Options) {
+	b.Helper()
+
+	node, err := Parse(q, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	ix := benchCorpusLarge()
+	s := NewSearcher(ix, scoring.BM25{})
+
+	// 顺带把索引规模打进基准输出，作为「10 万篇常驻不 OOM」的证据。
+	st := ix.Stats()
+	b.ReportMetric(float64(st.IndexBytes)/(1<<20), "index_MB")
+	b.ReportMetric(float64(st.Terms), "terms")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		got, err := s.Search(node, SearchOptions{Limit: 10})
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchResult = got
+	}
+}
+
+// 下面三个基准是 PLAN 里「P99 < 20ms @ 10 万文档」的实测依据。
+// 注意语料是**最坏情况**：每个词条都命中全部 10 万篇（df = N）。
+// 真实场景下停用词被过滤，df 通常远小于 N。
+func BenchmarkSearch100kTerm(b *testing.B) {
+	benchSearchLarge(b, "quick", Options{})
+}
+
+func BenchmarkSearch100kPhrase(b *testing.B) {
+	benchSearchLarge(b, `"quick brown"`, Options{})
+}
+
+func BenchmarkSearch100kAnd(b *testing.B) {
+	benchSearchLarge(b, "quick brown", Options{DefaultOp: OpAnd})
+}
+
+func BenchmarkSearch100kMustNot(b *testing.B) {
+	benchSearchLarge(b, "quick -running", Options{})
+}

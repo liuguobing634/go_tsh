@@ -111,35 +111,46 @@ func TestViewScanMissingTerm(t *testing.T) {
 	}
 }
 
-func TestViewEachDocument(t *testing.T) {
+func TestViewSortedDocIDs(t *testing.T) {
 	ix := newTestIndex(t)
+
+	var want []DocID
 	for i := 0; i < 5; i++ {
-		if _, err := ix.Add(fmt.Sprintf("d%d", i), map[string]string{"body": "token"}); err != nil {
+		ext := fmt.Sprintf("d%d", i)
+		if _, err := ix.Add(ext, map[string]string{"body": "token"}); err != nil {
 			t.Fatal(err)
 		}
+		want = append(want, docIDOf(t, ix, ext))
 	}
 
-	seen := 0
 	ix.View(func(v *View) {
-		v.EachDocument(func(DocID) bool {
-			seen++
-			return true
-		})
+		got := v.SortedDocIDs()
+		if !slices.Equal(got, want) {
+			t.Fatalf("SortedDocIDs() = %v, want %v", got, want)
+		}
 	})
-	if seen != 5 {
-		t.Errorf("EachDocument 遍历 %d 篇，want 5", seen)
+
+	// 删除中间一篇后仍应有序、且不再包含被删的 ID。
+	if err := ix.Delete("d2"); err != nil {
+		t.Fatal(err)
 	}
 
-	seen = 0
 	ix.View(func(v *View) {
-		v.EachDocument(func(DocID) bool {
-			seen++
-			return false
-		})
+		got := v.SortedDocIDs()
+		if len(got) != 4 {
+			t.Fatalf("删除后应有 4 篇，实际 %d", len(got))
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i] <= got[i-1] {
+				t.Fatalf("必须严格升序：%v", got)
+			}
+		}
+		for _, id := range got {
+			if id == want[2] {
+				t.Errorf("已删除的 %d 不应出现", id)
+			}
+		}
 	})
-	if seen != 1 {
-		t.Errorf("提前结束时 EachDocument 应只访问 1 篇，实际 %d", seen)
-	}
 }
 
 // View 内不得调用写方法（会死锁），这里只验证读路径本身不会互相阻塞，
