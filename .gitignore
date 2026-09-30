@@ -29,3 +29,8 @@ Thumbs.db
 # 本地数据与日志
 /data/
 *.log
+
+# Go 构建缓存：文件系统沙箱下默认 GOCACHE 在工作区之外不可写，
+# scripts/check.ps1 会自动回退到这里。
+/.gocache/
+

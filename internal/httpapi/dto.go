@@ -14,6 +14,7 @@ type healthResponse struct {
 type statsResponse struct {
 	Docs       int     `json:"docs"`
 	Terms      int     `json:"terms"`
+	Fields     int     `json:"fields"`
 	AvgDocLen  float64 `json:"avg_doc_len"`
 	IndexBytes int64   `json:"index_bytes"`
 }

@@ -67,6 +67,7 @@ func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, statsResponse{
 		Docs:       st.Docs,
 		Terms:      st.Terms,
+		Fields:     st.Fields,
 		AvgDocLen:  st.AvgDocLen,
 		IndexBytes: st.IndexBytes,
 	})
