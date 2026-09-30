@@ -2,6 +2,7 @@ package tsh
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 )
 
@@ -76,6 +77,50 @@ func BenchmarkUpsertPersistentSyncEach(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// 并发写入：验证「钩子放在索引写锁内」**没有**把分析阶段也串行化。
+//
+// 这是设计上的一个明确主张，必须实测而不是靠推理：
+// prepare（分析）刻意跑在写锁之外，钩子只在写锁内做一次追加。
+// 如果实现退化成「引擎级大锁包住整个 Add」，这里的吞吐会明显塌下来。
+func benchmarkParallelUpsert(b *testing.B, opts Options) {
+	b.Helper()
+
+	if opts.DataDir != "" {
+		opts.DataDir = b.TempDir()
+	}
+	opts.Logger = quiet()
+
+	e, err := NewWith(opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer e.Close()
+
+	var seq atomic.Int64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			// 每个 writer 用不重复的 ID，避免相互覆盖影响可比性
+			i := int(seq.Add(1))
+			if _, err := e.Upsert(benchDoc(i)); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
+func BenchmarkParallelUpsertInMemory(b *testing.B) {
+	benchmarkParallelUpsert(b, Options{})
+}
+
+func BenchmarkParallelUpsertPersistent(b *testing.B) {
+	benchmarkParallelUpsert(b, Options{DataDir: "unused"})
 }
 
 // 重放开销：它决定重启要多久，是持久化最容易被忽略的成本。
