@@ -12,42 +12,54 @@ import (
 func tk(term string, pos uint32) Token { return Token{Term: term, Position: pos} }
 
 func TestAnalyze(t *testing.T) {
+	// 绝大多数用例只想验证「切分与归一化」，因此默认关闭停用词过滤。
+	// 否则用例里一个普通英文单词（例如 out）恰好命中停用词表时，
+	// 断言会以难以察觉的方式失效——这正是本用例集第一版踩过的坑。
 	cases := []struct {
-		name string
-		text string
-		want []Token
+		name          string
+		text          string
+		want          []Token
+		withStopwords bool
 	}{
-		{"空串", "", nil},
-		{"纯标点", "!!! ... ---", nil},
-		{"纯空白", " \t\n\r ", nil},
+		{"空串", "", nil, false},
+		{"纯标点", "!!! ... ---", nil, false},
+		{"纯空白", " \t\n\r ", nil, false},
 
-		{"基本切分与位置", "Hello, WORLD!", []Token{tk("hello", 0), tk("world", 1)}},
-		{"前导空白不占位置", "  a   bb  ", []Token{tk("bb", 1)}},
-		{"数字与字母混合", "go1.22 is out", []Token{tk("go1", 0), tk("22", 1), tk("out", 3)}},
+		{"基本切分与位置", "Hello, WORLD!", []Token{tk("hello", 0), tk("world", 1)}, false},
+		{"短词被过滤但仍占位", "  a   bb  ", []Token{tk("bb", 1)}, false},
+		{"数字与字母混合", "go1.22 is out", []Token{tk("go1", 0), tk("22", 1), tk("is", 2), tk("out", 3)}, false},
 
-		// 停用词被过滤，但仍占用位置，于是 quick/brown 的位置差保持为 1。
-		{"停用词留下位置间隙", "the quick brown fox", []Token{tk("quick", 1), tk("brown", 2), tk("fox", 3)}},
+		{"大小写归一", "GoLang", []Token{tk("golang", 0)}, false},
+		{"全角折叠", "ＦＵＬＬＷＩＤＴＨ１２３", []Token{tk("fullwidth123", 0)}, false},
+		{"全角空格作分隔符", "foo\u3000bar", []Token{tk("foo", 0), tk("bar", 1)}, false},
 
-		{"大小写归一", "GoLang", []Token{tk("golang", 0)}},
-		{"全角折叠", "ＦＵＬＬＷＩＤＴＨ１２３", []Token{tk("fullwidth123", 0)}},
-		{"全角空格作分隔符", "foo\u3000bar", []Token{tk("foo", 0), tk("bar", 1)}},
+		{"中文逐字切分", "全文搜索", []Token{tk("全", 0), tk("文", 1), tk("搜", 2), tk("索", 3)}, false},
+		{"中英混合", "Go语言search", []Token{tk("go", 0), tk("语", 1), tk("言", 2), tk("search", 3)}, false},
+		{"最小长度不作用于中文单字", "a中", []Token{tk("中", 1)}, false},
 
-		{"中文逐字切分", "全文搜索", []Token{tk("全", 0), tk("文", 1), tk("搜", 2), tk("索", 3)}},
-		{"中英混合", "Go语言search", []Token{tk("go", 0), tk("语", 1), tk("言", 2), tk("search", 3)}},
-		{"最小长度不作用于中文单字", "a中", []Token{tk("中", 1)}},
+		{"词内撇号保持完整", "don't stop", []Token{tk("don't", 0), tk("stop", 1)}, false},
+		{"弯引号归一为直引号", "don\u2019t stop", []Token{tk("don't", 0), tk("stop", 1)}, false},
+		{"撇号不粘连相邻词", "end. 'start'", []Token{tk("end", 0), tk("start", 1)}, false},
 
-		{"词内撇号保持完整", "don't stop", []Token{tk("stop", 1)}},
-		{"弯引号归一为直引号", "don\u2019t stop", []Token{tk("stop", 1)}},
-		{"撇号不粘连相邻词", "end. 'start'", []Token{tk("end", 0), tk("start", 1)}},
+		{"连字符与下划线作分隔符", "foo_bar-baz", []Token{tk("foo", 0), tk("bar", 1), tk("baz", 2)}, false},
+		{"纯数字保留", "2024", []Token{tk("2024", 0)}, false},
+		{"重复词各自占位", "go go go", []Token{tk("go", 0), tk("go", 1), tk("go", 2)}, false},
 
-		{"连字符与下划线作分隔符", "foo_bar-baz", []Token{tk("foo", 0), tk("bar", 1), tk("baz", 2)}},
-		{"纯数字保留", "2024", []Token{tk("2024", 0)}},
-		{"重复词各自占位", "go go go", []Token{tk("go", 0), tk("go", 1), tk("go", 2)}},
+		// 停用词过滤：被过滤的词条仍占用位置，
+		// 于是 quick 与 brown 的位置差保持为 1，短语 "quick brown" 仍能命中。
+		{"停用词留下位置间隙", "the quick brown fox", []Token{tk("quick", 1), tk("brown", 2), tk("fox", 3)}, true},
+		{"停用词不影响后续词的位置", "out of the box", []Token{tk("box", 3)}, true},
 	}
 
-	a := NewStandard()
+	tokenizer := NewStandardWith(StandardOptions{KeepStopwords: true})
+	filtering := NewStandard()
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			a := tokenizer
+			if tc.withStopwords {
+				a = filtering
+			}
 			got := a.Analyze(tc.text)
 			if !slices.Equal(got, tc.want) {
 				t.Fatalf("Analyze(%q)\n got: %v\nwant: %v", tc.text, got, tc.want)
