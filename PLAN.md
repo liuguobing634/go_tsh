@@ -285,25 +285,34 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 
 ## 6. TODO List
 
-### Phase 0 — 环境准备
+### Phase 0 — 环境准备 ✅ 已完成（commit 24228da）
 
 > **实测环境记录**
 > - Go：`go1.27.1 windows/amd64`，安装于 `D:\Program Files\Go`，`GOROOT` 自动识别正确
 > - **`go` 未加入 PATH**（`where go` 无结果），`GOROOT` 环境变量为空 → 需显式加 PATH 或用全路径调用
 > - `GOPATH=C:\Users\liuguobing\go`，`GOPROXY=https://proxy.golang.org,direct`
 > - **本项目零第三方依赖，因此 GOPROXY 是否可达不影响构建**（已实测外网代理在非交互 shell 下不可验证，可忽略）
-> - 沙箱：`workspace-write` 模式初始化失败，见下方阻塞项
+> - Shell 实为 **Windows PowerShell 5.1**（`PSEdition=Desktop`，并非 pwsh 7）：`Console.OutputEncoding=utf-8` 但 `InputEncoding=gb2312`，**`Get-Content` 默认按 ANSI/GBK 解码**，读 Go 程序输出的 UTF-8 日志会乱码（实测 `服务启动` 显示为 `鏈嶅姟鍚姩`），必须显式 `Get-Content -Encoding utf8`；日志文件本身的字节是正确的 UTF-8（`e6 9c 8d e5 8a a1 ...`）
+> - ⚠️ **`-race` 在本机不可用**：`CGO_ENABLED=0` 且宿主无任何 C 编译器（gcc / clang / tcc 均未找到，`GOENV` 文件不存在）。竞态检测依赖 cgo，没有它就完全跑不了
+> - 沙箱：`workspace-write` 模式至今仍初始化失败，见下方遗留阻塞
 
-- [x] ~~确认 Go 工具链~~ → 已定位 `D:\Program Files\Go\bin\go.exe`，版本 1.27.1
-- [x] ~~创建 `D:\codes\golang\go_tsh` 目录~~ → 已由文档写入创建
-- [ ] **解决沙箱阻塞（最高优先级）**：`pwsh` 在 `workspace-write` 模式下每次启动即报 `SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\codes\golang\go_tsh)`，无法执行任何命令；仅 `danger-full-access` 可用。需以管理员身份授予当前用户对该目录的完全控制（或 `WRITE_DAC`），否则后续所有 `go build/test` 都只能走逐条审批
-- [ ] 把 `D:\Program Files\Go\bin` 加入用户 PATH（或在 `Makefile` / 脚本中用绝对路径 + `GO` 变量封装）
-- [ ] `go mod init github.com/<username>/go_tsh`（模块名待定，需确认）
-- [ ] 建目录骨架：`cmd/tshd`、`internal/{analyzer,index,query,scoring,httpapi}`、`pkg/tsh`、`testdata/corpus`、`deploy`
-- [ ] `Makefile`：`fmt` / `vet` / `test` / `race` / `bench` / `run` / `check`（`GO ?= go` 便于覆盖路径）
-- [ ] `.gitignore`（二进制、覆盖率、`*.out`）
-- [ ] `git init` + 首次提交
-- [ ] **验收**：`make check` 在空骨架下即全绿
+- [x] 确认 Go 工具链 → `D:\Program Files\Go\bin\go.exe`，`go1.27.1`
+- [x] 创建 `D:\codes\golang\go_tsh` 目录
+- [x] `go mod init` → `github.com/liuguobing/go_tsh`（go.mod 直写，`go mod tidy` 已验证零依赖）
+- [x] 目录骨架：`cmd/tshd`、`internal/{analyzer,index,query,scoring,httpapi,config}`、`pkg/tsh`、`scripts`
+- [x] `internal/config`：flag + `TSH_*` 环境变量，优先级 **flag > env > default**，含全字段校验与表驱动测试
+- [x] `internal/httpapi`：Go 1.22 `ServeMux` 方法路由、recover / 访问日志 / body 限流中间件链、统一错误响应、DTO
+- [x] `pkg/tsh`：`Engine` 门面与 `Stats`
+- [x] `cmd/tshd`：JSON 结构化日志、`signal.NotifyContext` 优雅关闭、`-ldflags` 版本注入
+- [x] `Makefile`（fmt / fmt-check / vet / test / race / cover / bench / build / run / check）
+- [x] `scripts/check.ps1`：自动从 `GOROOT` 推导 gofmt 绝对路径，`-race` 不可用时自动降级为普通 `go test` 并明确告警
+- [x] `.gitignore`、`.gitattributes`、`README.md`（含配置表与接口清单）
+- [x] `git init` + 首次提交
+- [x] **验收**：`go build ./...` / `go vet ./...` / `gofmt -l .` / `go test ./...` 全绿；二进制冒烟测试通过（`/healthz`→200、`/api/v1/stats`→200、未知路径→404、`POST /healthz`→405）
+- [ ] **遗留阻塞 1｜沙箱**：`pwsh` 在 `workspace-write` 下启动即报 `SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\codes\golang\go_tsh)`，仅 `danger-full-access` 可用。需以管理员授予当前用户对该目录的完全控制（`WRITE_DAC`）
+- [ ] **遗留阻塞 2｜`-race` 不可用**：需安装 mingw-w64 并令 `CGO_ENABLED=1`，或把 `-race` 门禁下沉到 Linux CI。**在解决前，Phase 1 之后的并发安全只能靠人工审查，缺少工具兜底**
+- [ ] **遗留项｜PATH**：把 `D:\Program Files\Go\bin` 加入用户 PATH（当前靠脚本绝对路径兜底，不影响开发）
+- [ ] **遗留项｜换行符**：`git` 提示 LF→CRLF 转换，已加 `.gitattributes`，需 `git add --renormalize .` 落地
 
 ### Phase 1 — 文本分析器
 - [ ] 定义 `Token{Term string; Position uint32}` 与 `Analyzer` 接口
