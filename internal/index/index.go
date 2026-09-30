@@ -25,6 +25,25 @@ import (
 	"github.com/liuguobing/go_tsh/internal/analyzer"
 )
 
+// Change 描述一次**已经生效**的索引变更。
+//
+// 它只描述结果、不描述过程：Add / Update / Upsert 产生的都是
+// 「这个 ID 现在的字段是这些」，因此重放时一律按 Upsert 处理即可，
+// 不需要区分新建还是覆盖。
+type Change struct {
+	// External 是文档的外部 ID，不会为空。
+	External string
+
+	// Fields 是文档的全部字段。Deleted 为 true 时它没有意义。
+	//
+	// 这是索引内部持有的那份副本（写入后不再被修改），
+	// 回调可以读取与保留，但**不得修改**。
+	Fields map[string]string
+
+	// Deleted 为 true 表示这是一次删除。
+	Deleted bool
+}
+
 // Options 配置倒排索引；零值即为一套合理默认。
 type Options struct {
 	// Analyzer 用于切分文档，为 nil 时使用 analyzer.NewStandard()。
@@ -38,6 +57,24 @@ type Options struct {
 
 	// MaxTokens 是单文档 token 数上限（所有字段合计），<= 0 时取 100000。
 	MaxTokens int
+
+	// OnApply 在**写锁内、变更已经生效之后**被调用。
+	//
+	// 存在的理由是原子性：变更和「把变更记到外部」（例如追加持久化日志）
+	// 必须在同一把写锁里完成，否则并发写会让日志顺序与索引生效顺序错开——
+	// 重放出来的状态就会和实际状态不一致。
+	//
+	// 为什么不让调用方自己在外面加一把锁：prepare（分析）刻意跑在写锁
+	// **之外**，好让并发写能并行分析。在外面套锁会把这部分也串行化掉。
+	//
+	// 三条约定：
+	//  1. 它持写锁运行，**必须足够快**，不要在里面做耗时工作；
+	//  2. 回调失败时索引变更**不会回滚**——回滚要把刚做的插入/删除反向
+	//     执行一遍，代价与出错风险都不划算。语义上应理解为「本次写未提交」：
+	//     调用方把错误返回给客户端，重启后这次写不存在；
+	//  3. 回调失败后调用方应当进入降级状态、直接拒绝后续写，
+	//     否则索引会持续领先于日志，分歧越积越大。
+	OnApply func(Change) error
 }
 
 const (
@@ -50,6 +87,9 @@ type InvertedIndex struct {
 	analyzer  analyzer.Analyzer
 	maxFields int
 	maxTokens int
+
+	// onApply 见 Options.OnApply。构造后只读，因此无需加锁。
+	onApply func(Change) error
 
 	mu sync.RWMutex
 
@@ -104,6 +144,7 @@ func New(opts Options) *InvertedIndex {
 
 	return &InvertedIndex{
 		analyzer:         a,
+		onApply:          opts.OnApply,
 		maxFields:        maxFields,
 		maxTokens:        maxTokens,
 		terms:            make(map[string]*PostingList),
@@ -219,7 +260,11 @@ func (ix *InvertedIndex) Add(external string, fields map[string]string) (DocID, 
 		return InvalidDocID, fmt.Errorf("%w: %q", ErrDocumentExists, p.external)
 	}
 
-	return ix.insertLocked(p), nil
+	id := ix.insertLocked(p)
+	if err := ix.notifyApply(Change{External: p.external, Fields: p.fields}); err != nil {
+		return InvalidDocID, err
+	}
+	return id, nil
 }
 
 // Update 覆盖式更新。文档不存在时返回 ErrDocumentNotFound。
@@ -241,7 +286,12 @@ func (ix *InvertedIndex) Update(external string, fields map[string]string) (DocI
 	}
 
 	ix.removeLocked(old)
-	return ix.insertLocked(p), nil
+
+	id := ix.insertLocked(p)
+	if err := ix.notifyApply(Change{External: p.external, Fields: p.fields}); err != nil {
+		return InvalidDocID, err
+	}
+	return id, nil
 }
 
 // Upsert 存在则覆盖、不存在则新建，created 表示是否为新建。
@@ -260,7 +310,11 @@ func (ix *InvertedIndex) Upsert(external string, fields map[string]string) (id D
 		created = true
 	}
 
-	return ix.insertLocked(p), created, nil
+	id = ix.insertLocked(p)
+	if err := ix.notifyApply(Change{External: p.external, Fields: p.fields}); err != nil {
+		return InvalidDocID, false, err
+	}
+	return id, created, nil
 }
 
 // Delete 删除文档。文档不存在时返回 ErrDocumentNotFound。
@@ -279,7 +333,15 @@ func (ix *InvertedIndex) Delete(external string) error {
 	}
 
 	ix.removeLocked(doc)
-	return nil
+	return ix.notifyApply(Change{External: external, Deleted: true})
+}
+
+// notifyApply 在写锁内通知外部「索引已经变更」。调用方必须持有写锁。
+func (ix *InvertedIndex) notifyApply(c Change) error {
+	if ix.onApply == nil {
+		return nil
+	}
+	return ix.onApply(c)
 }
 
 // insertLocked 把已分析好的文档写入索引。调用方必须持有写锁。
