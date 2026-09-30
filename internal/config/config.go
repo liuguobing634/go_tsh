@@ -51,6 +51,17 @@ type Config struct {
 	// NoSubWords 关闭中文的子词扩展：索引更小、写入更快，但只能整词匹配。
 	// 仅在 analyzer 为 chinese 时生效。
 	NoSubWords bool
+
+	// DataDir 是持久化目录；为空表示不持久化（纯内存，重启即丢）。
+	//
+	// 目录下会有一个只追加的 documents.wal，启动时重放它来重建索引。
+	DataDir string
+
+	// SyncInterval 是批量 fsync 的间隔，必须为正。
+	//
+	// 写入返回后数据已经交给操作系统（进程崩溃不丢），
+	// 断电最多丢这个间隔内的写。调小更安全但更慢。
+	SyncInterval time.Duration
 }
 
 // Default 返回一套可直接用于本地开发的默认配置。
@@ -68,6 +79,7 @@ func Default() Config {
 		IdleTimeout:   60 * time.Second,
 		ShutdownGrace: 10 * time.Second,
 		Analyzer:      AnalyzerStandard,
+		SyncInterval:  100 * time.Millisecond,
 	}
 }
 
@@ -103,6 +115,8 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 	fs.StringVar(&cfg.Analyzer, "analyzer", cfg.Analyzer, "文本分析器：standard|chinese")
 	fs.StringVar(&cfg.DictPath, "dict", cfg.DictPath, "中文自定义词典文件（每行一个词）")
 	fs.BoolVar(&cfg.NoSubWords, "no-sub-words", cfg.NoSubWords, "关闭中文子词扩展")
+	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "持久化目录（留空则不持久化）")
+	fs.DurationVar(&cfg.SyncInterval, "sync-interval", cfg.SyncInterval, "批量 fsync 间隔")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, fmt.Errorf("解析命令行参数: %w", err)
@@ -191,6 +205,14 @@ func (c Config) Validate() error {
 	// generate 是唯一允许为 0 的数值项：0 表示不合成语料。
 	if c.GenerateDocs < 0 {
 		return fmt.Errorf("generate 不能为负数，当前为 %d", c.GenerateDocs)
+	}
+
+	// sync-interval 必须为正。
+	//
+	// 不能用 0 表示「不后台刷盘」：0 是 tsh.Options 的零值，那里把它解释为
+	// 「用默认间隔」。同一个值在两处含义不同迟早出事，索性只留一种含义。
+	if c.SyncInterval <= 0 {
+		return fmt.Errorf("sync-interval 必须为正数，当前为 %s", c.SyncInterval)
 	}
 
 	positiveDurations := []struct {

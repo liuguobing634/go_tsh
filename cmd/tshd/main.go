@@ -7,13 +7,15 @@
 //	tshd -generate 100000                   # 启动时合成 10 万篇语料（压测用）
 //	tshd -analyzer chinese                  # 汉字走词典分词
 //	tshd -analyzer chinese -dict ./words.txt # 再追加领域词
+//	tshd -data-dir ./data                   # 持久化，重启后数据还在
 //
 // 每个命令行参数都可被同名环境变量覆盖（前缀 TSH_、中划线转下划线并大写），
 // 例如 -query-timeout 对应 TSH_QUERY_TIMEOUT。
 // 命令行显式指定的值优先级最高，不会被环境变量覆盖。
 //
 // 注意：-analyzer 会决定索引里存的是什么词条，因此**换分析器必须重建索引**。
-// 内存索引在进程重启时重建，改这个参数后重启即可。
+// 持久化的是原文而不是索引，所以换分析器后重启会自动按新分析器重建，
+// 不需要手工清理数据。
 package main
 
 import (
@@ -52,10 +54,27 @@ func run(args []string) int {
 
 	// 这些上限此前只被解析与校验，从未接进引擎——用户改了
 	// -max-doc-tokens / -max-doc-fields / -max-query-terms 不会有任何效果。
-	engine, err := newEngine(cfg)
+	engine, err := newEngineWithLogger(cfg, logger)
 	if err != nil {
 		logger.Error("创建引擎失败", "err", err)
 		return 1
+	}
+
+	// 引擎持有持久化日志的文件句柄。不管从哪条路径退出都要关掉它，
+	// 否则最后一次 fsync 不会发生，最近一批写会在断电时丢失。
+	//
+	// defer 在这里正好给出想要的顺序：下面的优雅关闭是行内代码，
+	// 先跑完（停止接收请求 → 等待在途请求结束），return 时才轮到 Close。
+	// 这样就不会有「日志已关但请求还在写」的窗口。
+	defer func() {
+		if err := engine.Close(); err != nil {
+			logger.Error("关闭引擎失败，最近一批写可能未落盘", "err", err)
+		}
+	}()
+
+	if cfg.DataDir != "" {
+		logger.Info("持久化已启用",
+			"dir", cfg.DataDir, "sync_interval", cfg.SyncInterval.String())
 	}
 
 	// 语料导入必须发生在监听之前：否则客户端可能在索引还没灌完时

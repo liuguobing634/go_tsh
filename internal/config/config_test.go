@@ -175,3 +175,55 @@ func TestAnalyzerConfig(t *testing.T) {
 		}
 	})
 }
+
+func TestPersistenceConfig(t *testing.T) {
+	t.Run("默认不持久化", func(t *testing.T) {
+		cfg, err := Load(nil, mapEnv(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DataDir != "" {
+			t.Errorf("默认 data-dir 应为空（纯内存），实际 %q", cfg.DataDir)
+		}
+		if cfg.SyncInterval != 100*time.Millisecond {
+			t.Errorf("默认 sync-interval = %s, want 100ms", cfg.SyncInterval)
+		}
+	})
+
+	t.Run("命令行与环境变量", func(t *testing.T) {
+		cfg, err := Load([]string{"-data-dir", "./data", "-sync-interval", "5ms"}, mapEnv(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DataDir != "./data" {
+			t.Errorf("data-dir = %q", cfg.DataDir)
+		}
+		if cfg.SyncInterval != 5*time.Millisecond {
+			t.Errorf("sync-interval = %s", cfg.SyncInterval)
+		}
+
+		cfg, err = Load(nil, mapEnv(map[string]string{
+			"TSH_DATA_DIR":      "/var/lib/tsh",
+			"TSH_SYNC_INTERVAL": "1s",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.DataDir != "/var/lib/tsh" {
+			t.Errorf("从环境变量读到的 data-dir = %q", cfg.DataDir)
+		}
+		if cfg.SyncInterval != time.Second {
+			t.Errorf("从环境变量读到的 sync-interval = %s", cfg.SyncInterval)
+		}
+	})
+
+	// 0 不能表示「不后台刷盘」：它是 tsh.Options 的零值，
+	// 那里把它解释为「用默认间隔」。同一个值两处含义不同迟早出事。
+	t.Run("sync-interval 必须为正", func(t *testing.T) {
+		for _, v := range []string{"0s", "-1s"} {
+			if _, err := Load([]string{"-sync-interval", v}, mapEnv(nil)); err == nil {
+				t.Errorf("sync-interval=%s 应当报错", v)
+			}
+		}
+	})
+}
