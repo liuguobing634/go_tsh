@@ -2,11 +2,12 @@
 
 用 Go 从零实现的全文搜索服务：**单二进制、手写内存倒排索引、HTTP JSON API**。
 
-> 当前进度：**Phase 0–5 全部完成**，并已加入**中文分词与检索**。
+> 当前进度：**Phase 0–5 全部完成**，并已加入**中文分词与检索**、
+> **L1 文档持久化**（追加式原文日志 + 启动重放）。
 > 10 万篇规模下检索 P99 < 20ms；`make check`（含 `-race`）全绿。
 > 性能数据与压测记录见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，
 > 中文支持的实测对比与设计见 [docs/CHINESE.md](docs/CHINESE.md)，
-> 完整规划与选型理由见 [PLAN.md](PLAN.md)。
+> 持久化方案、实测代价与后续计划见 [PLAN.md](PLAN.md) 的 Phase 8。
 
 > **依赖说明（相对原计划的修订）**
 >
@@ -32,6 +33,7 @@
 - 布尔查询：`AND` / `OR` / `NOT`，以及 `-term` 排除语法
 - 文档增删改查、高亮片段
 - **中文检索**：词典分词 + 子词扩展（`-analyzer chinese`）
+- **持久化**：追加式原文日志 + 启动重放（`-data-dir`），崩溃可恢复
 - 标准库实现：`net/http`、`log/slog`、`encoding/json`
 
 ## 快速开始
@@ -107,6 +109,43 @@ curl.exe --noproxy "*" "http://127.0.0.1:8080/api/v1/search?q=%E5%80%92%E6%8E%92
 > 完整实测数据、两个分析器的真实差别、以及已知取舍见
 > **[docs/CHINESE.md](docs/CHINESE.md)**。
 
+### 持久化
+
+```powershell
+./bin/tshd.exe -addr :8080 -data-dir ./data
+```
+
+数据存成 `data/documents.wal`：一个**只追加的原文日志**，启动时重放它重建索引。
+不带 `-data-dir` 就是纯内存，行为与以前完全一致。
+
+**为什么存原文而不是索引**：换分析器、改索引格式、修索引 bug 之后，
+索引都可以从原文重建；反过来只存索引，就等于把数据锁死在一种格式上。
+**索引是派生数据，原文才是权威数据。**
+
+**持久性保证**（批量 fsync，默认 100ms）：
+
+| 场景 | 保证 |
+| --- | --- |
+| 写入返回后**进程崩溃** | **不丢** —— 数据已经交给操作系统 |
+| **断电 / 宿主机崩溃** | 最多丢 100ms 内的写 |
+| 正常关闭（Ctrl+C / SIGTERM） | 做最后一次 fsync |
+
+代价是写入慢约 **3.9 倍**（11µs → 44µs，折合约 22,800 次写/秒单线程）。
+每次写都 fsync 是 **76 倍**——这就是选批量策略的量化依据。
+
+**重启代价 ≈ 重建索引代价**，因为 L1 不落索引，每次都要重新分析：
+2000 篇实测 32.8ms，换算到 10 万篇中等长度文档约 **15 秒**。
+如果启动时间成为痛点，下一步是持久化 token 流（PLAN 里的 L3）。
+
+**损坏处理**：
+
+- 日志**尾部**不完整或校验失败 → 自动截断并告警（这是崩溃时写了一半的记录）
+- 损坏之后**还跟着大量数据** → **拒绝启动**，交人工检查
+  （截断等于把后面可能完好的记录一起丢掉，不能静默做）
+- 文件头魔数或版本不符 → 拒绝启动，**不覆盖**已有文件
+- 日志写不下去（磁盘满等）→ 进入降级状态，后续写一律快速失败，
+  读请求不受影响。**不会静默丢数据。**
+
 ## 容器与 CI
 
 ```bash
@@ -152,6 +191,8 @@ CI runner 能直连 `proxy.golang.org`，不需要镜像配置；
 | `-analyzer` | `TSH_ANALYZER` | `standard` | `standard` / `chinese`，**换值必须重建索引** |
 | `-dict` | `TSH_DICT` | 空 | 中文自定义词典文件；需 `-analyzer chinese` |
 | `-no-sub-words` | `TSH_NO_SUB_WORDS` | `false` | 关闭中文子词扩展；需 `-analyzer chinese` |
+| `-data-dir` | `TSH_DATA_DIR` | 空 | 持久化目录；**留空即纯内存，重启丢失** |
+| `-sync-interval` | `TSH_SYNC_INTERVAL` | `100ms` | 批量 fsync 间隔，必须为正 |
 | `-max-body-bytes` | `TSH_MAX_BODY_BYTES` | `8388608` | 单请求体字节上限（8 MiB） |
 | `-max-doc-fields` | `TSH_MAX_DOC_FIELDS` | `32` | 单文档字段数上限 |
 | `-max-doc-tokens` | `TSH_MAX_DOC_TOKENS` | `100000` | 单文档 token 数上限 |
