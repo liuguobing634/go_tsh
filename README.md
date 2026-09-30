@@ -2,7 +2,7 @@
 
 用 Go 从零实现的全文搜索服务：**单二进制、零第三方依赖、内存倒排索引、HTTP JSON API**。
 
-> 当前进度：**Phase 1（文本分析器）已完成**，下一步 Phase 2（倒排索引内核）。
+> 当前进度：**Phase 2（倒排索引内核）已完成**，下一步 Phase 3（查询与打分）。
 > 完整的项目规划、选型理由与分阶段 TODO 见 [PLAN.md](PLAN.md)。
 
 ## 特性（目标）
@@ -88,7 +88,7 @@ cmd/tshd/          # 守护进程入口：配置装配、日志、优雅关闭
 internal/config/   # 配置解析（flag + env）
 internal/httpapi/  # HTTP 路由、中间件、DTO、错误映射
 internal/analyzer/ # 文本分析 ✅ StandardAnalyzer + 内置停用词表
-internal/index/    # 倒排索引（Phase 2）
+internal/index/    # 倒排索引 ✅ InvertedIndex + posting list
 internal/query/    # 查询 AST 与解析（Phase 3）
 internal/scoring/  # BM25 与 Top-K（Phase 3）
 pkg/tsh/           # 对外门面 Engine
@@ -143,11 +143,32 @@ Windows PowerShell 5.1 的 `Get-Content` 默认按 ANSI（简体中文下为 GBK
 `check.ps1` 自动降级为普通 `go test` 并明确告警——**不会假装通过**。
 安装 mingw-w64 后设置 `CGO_ENABLED=1` 即可启用。
 
+### 沙箱内 `go build` 报 `Access is denied`（GOCACHE）
+
+```
+open C:\Users\<user>\AppData\Local\go-build\...: Access is denied
+```
+
+文件系统沙箱（`workspace-write`）**只放行工作区**，而 Go 的构建缓存默认在
+工作区之外。注意这**不是 ACL 问题**——实测给缓存目录补写显式 FullControl
+ACE 完全无效，DSH 沙箱按路径白名单判定，而非按 ACL。
+
+`scripts/check.ps1` 会自动处理：它**实际探测**默认缓存能否写入
+（建一个探针文件再删掉。ACL、受限令牌、只读挂载在 `Test-Path` 下长得一模一样，
+只有真写一次才能区分），不可写就回退到 `<repo>/.gocache/`。
+沙箱外行为不变。
+
+手动执行 `go` 命令时同理：
+
+```powershell
+$env:GOCACHE = "$PWD\.gocache"
+```
+
 ### 沙箱内 `go` 警告模块缓存不可写
 
 ```
-writing stat cache: open C:\Users\liuguobing\go\pkg\mod\cache\...: Access is denied
+writing stat cache: open C:\Users\<user>\go\pkg\mod\cache\...: Access is denied
 ```
 
-本项目零第三方依赖，构建与测试都不受影响。若将来引入依赖，
-把 `GOMODCACHE` 指向工作区内即可。
+本项目零第三方依赖，构建与测试都不受影响，属噪音级警告。
+若将来引入依赖，把 `GOMODCACHE` 同样指向工作区内。

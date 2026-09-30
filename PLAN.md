@@ -345,10 +345,25 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
       `scripts/check.ps1` 全部在沙箱内通过。
 
       **回滚**：`icacls "D:\codes\golang\go_tsh" /remove:g "%USERNAME%"`
-- [ ] **遗留观察｜沙箱内模块缓存不可写**：`go` 会打印
+- [x] **遗留阻塞 3｜沙箱只放行工作区，Go 构建缓存不可写 —— 已修复**
+
+      症状：新增源文件后 `go build` 全量失败：
+      `open C:\Users\liuguobing\AppData\Local\go-build\...: Access is denied`。
+      之前几轮能过只是因为全部命中缓存、**根本不需要写缓存**。
+
+      **关键结论：DSH 沙箱按「路径白名单」放行，不认 ACL。**
+      实测给 `GOCACHE` / `GOMODCACHE` 补写显式 FullControl ACE **完全无效**——
+      这与工作区的情况不同：工作区之所以靠加 ACE 就修好，是因为它本来就在
+      DSH 白名单内，DSH 自己会去给它 `SetNamedSecurityInfoW(grantWrite)`，
+      只是当时那条 ACL 写不进去。
+
+      修复：`scripts/check.ps1` 启动时**实际探测**默认 GOCACHE 的可写性
+      （建探针文件再删，ACL / 受限令牌 / 只读挂载在 `Test-Path` 下长得一模一样），
+      不可写就自动回退到 `<repo>/.gocache/`。沙箱外行为完全不变。
+- [ ] **遗留观察｜沙箱内模块缓存仍不可写**：`go` 仍会打印
       `writing stat cache: open C:\Users\liuguobing\go\pkg\mod\cache\...: Access is denied`。
-      本项目零依赖，构建与测试均不受影响（`GOCACHE` 仍可用，测试能命中缓存）。
-      若将来引入第三方依赖，需把 `GOMODCACHE` 指向工作区内，或放行该路径。
+      本项目零依赖，构建与测试均不受影响，属噪音级警告。
+      若将来引入第三方依赖，需把 `GOMODCACHE` 同样指向工作区内。
 - [ ] **遗留阻塞 2｜`-race` 不可用**：需安装 mingw-w64 并令 `CGO_ENABLED=1`，或把 `-race` 门禁下沉到 Linux CI。**在解决前，Phase 1 之后的并发安全只能靠人工审查，缺少工具兜底**
 - [ ] **遗留项｜PATH**：把 `D:\Program Files\Go\bin` 加入用户 PATH（当前靠脚本绝对路径兜底，不影响开发）
 - [ ] **遗留项｜换行符**：`git` 提示 LF→CRLF 转换，已加 `.gitattributes`，需 `git add --renormalize .` 落地
@@ -396,30 +411,79 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 > 现已改为 `tokenizer(KeepStopwords)` 与 `filtering(默认)` 两个分析器，
 > 用例显式声明是否启用停用词，把两件事彻底解耦。
 
-### Phase 2 — 索引内核
-- [ ] 定义 `DocID` / `Document` / `Posting` / `PostingList`
-- [ ] `InvertedIndex` 结构 + `sync.RWMutex`
-- [ ] `AddDocument`：分析 → 按 term 聚合 TF 与 Positions → 写索引
-- [ ] term key 编码 `field + "\x00" + term`，并提供跨字段查询用的 key 生成函数
-- [ ] `UpdateDocument`：先摘除旧版本再插入，保证不产生幽灵命中
-- [ ] `DeleteDocument`：从所有相关 posting list 摘除 + tombstone
-- [ ] `GetDocument` / `Stats`（nDocs、term 数、avgdl）
-- [ ] posting list 保持按 DocID 有序（插入时二分定位）
-- [ ] 单测：新增/更新/删除、重复 term TF 正确、Positions 正确、删除后查不到、更新后旧词查不到
-- [ ] 并发测试：`go test -race` 下 N 写 M 读无数据竞争
-- [ ] 基准：`BenchmarkIndex10kDocs`、`BenchmarkDelete`
-- [ ] **验收**：10 万篇文档索引完成且 RSS 可观测、无泄漏
+### Phase 2 — 索引内核 ✅ 已完成（commit 5815de4）
+> **与原计划的偏差**
+> - **删除改为物理摘除，不用 tombstone**。原计划接受「逻辑删除 + 惰性压缩」的技术债，
+>   但既然 `removeLocked` 已能精确定位每条 posting，直接摘干净反而更简单：
+>   查询路径不必在运行时跳过墓碑，也没有后台压缩任务。
+> - **删除靠「重新分析原文」定位 posting**，而不是在文档上常驻 term key 列表。
+>   后者在 10 万文档量级要多吃数百 MB 常驻内存；删除是低频操作，
+>   重算一遍分词远比常驻内存划算。
+> - **分词挪到写锁之外**：`prepare` 先完成校验与全部分词，再加锁做结构修改，
+>   否则一个慢分词会阻塞所有其它写请求。
+> - **对外一律返回深拷贝**（`Get` / `Postings`），否则调用方能绕过锁改坏内部状态。
+
+- [x] 定义 `DocID` / `Document` / `Posting` / `PostingList`
+- [x] `InvertedIndex` + `sync.RWMutex`
+- [x] `Add`：分析 → 稳定排序分组得 TF 与 Positions → 写索引
+- [x] term key 编码 `field + "\x00" + term` + `SplitTermKey` 逆运算
+      （用 NUL 而非冒号：`(a, b:c)` 与 `(a:b, c)` 在冒号方案下会撞车）
+- [x] `Update`：完整摘除旧版本再插入，旧词条不留幽灵命中
+- [x] `Delete`：从所有相关 posting 摘除，空列表连同 key 一起回收
+- [x] `Get` / `Stats`（Docs / Terms / Fields / TotalTokens / AvgDocLen / IndexBytes）
+- [x] `Upsert`、`Has`、`DocFreq`、`DocLength`、`FieldStats`、`Fields`
+- [x] posting 按 DocID 严格升序（DocID 单调递增 + 删除整条摘除 ⇒ append 即有序）
+- [x] 单测：41 个用例，覆盖校验/重复/更新/删除/Upsert/字段隔离/posting 有序性/
+      副本语义/字段回收/统计/并发读写
+- [x] 并发测试：4 写 × 4 读 × 150 轮，结束后校验不变式
+- [x] 基准：`BenchmarkAddDocument` / `BenchmarkDeleteDocument` / `BenchmarkPostingsLookup`
+- [x] **验收**：覆盖率 **97.1%**；`go build` / `go vet` / `gofmt` / `go test` 全绿
+
+> **实测性能**（Intel Core Ultra 7 155H）
+>
+> | 基准 | ns/op | B/op | allocs/op |
+> | --- | --- | --- | --- |
+> | `AddDocument`（约 140 token，title+body） | 36,875 | 11,384 | 171 |
+> | `DeleteDocument`（同上） | 118,995 | 8,103 | 143 |
+> | `PostingsLookup`（1 万篇命中同一词条） | **701,225** | **407,680** | **10,001** |
+>
+> - 索引吞吐约 **27k docs/s**，满足「≥ 5000 docs/s」目标。
+> - **删除比新增慢 3.2 倍**：要重新分词，且每个词条都得在 posting 里二分查找 +
+>   切片搬移。删除属低频操作，暂可接受，但记为 Phase 5 的观察点。
+> - ⚠️ **`PostingsLookup` 0.7ms / 400KB 是必须解决的瓶颈**：`Postings()` 对每条记录
+>   都深拷贝 `Positions`，1 万条就是 1 万次分配。一次 3 词查询光拷贝约 2ms/万篇，
+>   10 万篇量级将直接击穿「P99 < 20ms」预算。方案见 Phase 3 开头的零拷贝改造。
 
 ### Phase 3 — 查询与打分
+> ⚠️ **首要任务：先解决 `Postings()` 的拷贝开销，再写打分逻辑。**
+> Phase 2 的基准已经量化了这个问题（0.7ms / 400KB / 1 万次分配，见上）。
+> 路线是新增零拷贝迭代接口，让整次检索在一次读锁内完成：
+>
+> ```go
+> // ScanPostings 在读锁内遍历 posting，不产生任何拷贝。
+> // fn 返回 false 提前结束；positions 仅在 fn 执行期间有效，不得保留。
+> // fn 内部绝不可调用索引的写方法（会死锁）。
+> func (ix *InvertedIndex) ScanPostings(field, term string,
+>     fn func(id DocID, tf uint32, positions []uint32) bool)
+> ```
+>
+> 关键观察：**只有短语查询需要 `Positions`**。普通词条查询拿到 `(DocID, TF)`
+> 就够了，为它们拷贝位置信息是纯粹的浪费。
+
+- [ ] 先实现零拷贝 `ScanPostings`，并用基准证明查询路径分配量降到接近 0
 - [ ] Query AST：`TermQuery` / `PhraseQuery` / `BooleanQuery{Must,Should,MustNot}`
 - [ ] `q` 字符串解析器：bare term、`"phrase"`、`-neg`、`AND`/`OR`/`NOT`、括号（可选）
-- [ ] **query 与 index 共用同一 Analyzer**（防止归一化不一致导致查不到）
-- [ ] posting list 归并：有序求交、求并（二分 + 双指针）
-- [ ] 短语查询：候选 doc 内位置差分连续判定
-- [ ] BM25：`IDF = ln(1 + (N-df+0.5)/(df+0.5))`，`tf` 饱和项，`k1=1.2 b=0.75`
+- [ ] **query 与 index 共用同一 Analyzer**（用 `Index().Analyzer()` 取）
+- [ ] posting list 归并：有序求交、求并（双指针）
+- [ ] 短语查询：**必须在单个字段内**判定位置连续性——各字段位置都从 0 开始，
+      跨字段拼位置会产生假阳性
+- [ ] BM25：`IDF = ln(1 + (N-df+0.5)/(df+0.5))`，`tf` 饱和项，`k1=1.2 b=0.75`；
+      **IDF 必须按字段计算**，否则短字段的高信息量会被长字段稀释
+- [ ] 跨字段检索：分别求值再把分数相加
 - [ ] Top-K 小顶堆（`container/heap`）
 - [ ] 高亮片段生成（窗口截取 + `<em>` 包裹，需 HTML 转义）
-- [ ] 单测：单 term、多 term OR/AND、短语误召拦截、否定词、空结果、排序确定性（同分按 DocID 升序）
+- [ ] 单测：单 term、多 term OR/AND、短语误召拦截、否定词、空结果、
+      排序确定性（同分按 DocID 升序）
 - [ ] 基准：`BenchmarkSearch1Term` / `3TermsPhrase` / `AndQuery`
 - [ ] **验收**：P99 < 20ms @ 10 万文档
 
@@ -481,7 +545,8 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 | **中文检索效果差** | 中文用户体感差 | 文档中明确标注限制；Phase 6 接入可插拔分词器 |
 | **并发写下的 map 竞争** | 数据损坏 / panic | 所有写路径持写锁；`-race` 进 CI 门禁 |
 | **相关性无客观标准** | 调参全靠感觉 | 固定黄金语料 + 期望 Top-3 结果集，作为回归测试 |
-| **沙箱/权限阻塞** | `workspace-write` 下 `pwsh` 完全不可用，构建与测试无法自动化 | **最高优先级**：修复 `D:\codes\golang\go_tsh` 目录 ACL（授予当前用户完全控制），否则 Phase 0 之后的每个命令都要逐条审批 |
+| **沙箱/权限阻塞** | `workspace-write` 下 `pwsh` 完全不可用，构建与测试无法自动化 | ✅ 已修复：工作区加显式 FullControl ACE。另注意沙箱按**路径白名单**放行而非 ACL，工作区外的缓存目录需靠 `check.ps1` 自动回退 |
+| **验证工具本身是错的** | 门禁永远绿灯，缺陷静默流入 | 🔴 已发生过一次：`check.ps1` 用 `$ok = & $Action` 判成败，而原生命令 stdout 也被吸进 `$ok`，非空数组恒为真 ⇒ `go vet`/`go test` 失败时仍报 `check passed`（见 commit 5815de4）。**教训：门禁本身必须做反向测试**——喂一个必然失败的输入，确认它真的会红 |
 | **`go` 不在 PATH** | 脚本与 CI 找不到工具链 | 用户 PATH 中追加 `D:\Program Files\Go\bin`；同时在 `Makefile` 里用可覆盖的 `GO` 变量兜底 |
 
 ---
