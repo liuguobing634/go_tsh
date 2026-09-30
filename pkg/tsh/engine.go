@@ -7,6 +7,8 @@ package tsh
 
 import (
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/liuguobing/go_tsh/internal/analyzer"
 	"github.com/liuguobing/go_tsh/internal/highlight"
@@ -60,16 +62,43 @@ type Options struct {
 
 	// Highlight 配置高亮输出。MaxLen 为零时取 160 字节。
 	Highlight highlight.Options
+
+	// DataDir 是持久化目录；**为空表示不持久化**，此时引擎是纯内存的，
+	// 行为与引入持久化之前完全一致。
+	//
+	// 目录下会有一个 documents.wal：只追加的原文日志。
+	// 进程重启时重放它来重建索引。
+	//
+	// 为什么存原文而不是索引：换分析器、改索引格式、修索引 bug 之后，
+	// 索引都可以从原文重建；反过来只存索引就等于把数据锁死在一种格式上。
+	// 索引是派生数据，原文才是权威数据。
+	DataDir string
+
+	// SyncInterval 是批量 fsync 的间隔，<= 0 时取 100ms。
+	//
+	// 语义：写入返回后数据已交给操作系统（**进程崩溃不丢**），
+	// 断电最多丢这个间隔内的写。
+	SyncInterval time.Duration
+
+	// Logger 用于报告恢复过程中的异常，为 nil 时用 slog.Default()。
+	Logger *slog.Logger
 }
 
 // Engine 是全文搜索引擎的对外句柄。
 //
 // 并发安全：所有状态都由内部 InvertedIndex 的 RWMutex 保护。
+//
+// 若通过 Options.DataDir 启用了持久化，使用完毕必须调用 Close
+// 停止后台刷盘并做最后一次 fsync；否则最后一次 fsync 之前的写
+// 在断电时可能丢失（进程正常退出不算，数据在页缓存里）。
 type Engine struct {
 	idx    *index.InvertedIndex
 	search *query.Searcher
 	hl     *highlight.Highlighter
 	popts  query.Options
+
+	// persist 为 nil 表示纯内存模式。
+	persist *persistState
 }
 
 // Stats 描述当前索引的规模，用于 /api/v1/stats 与容量观测。
@@ -98,7 +127,38 @@ func New() *Engine {
 //
 // 选择 AnalyzerChinese 时会加载内嵌中文词典，可能因为内存不足或
 // 词典文件不可读而失败，因此返回错误。
+//
+// 指定 Options.DataDir 时会打开持久化日志并把已有数据重放进来；
+// 重放失败会返回错误而不是静默跳过——静默跳过等于无声地丢数据。
+// 这种情况下创建的引擎持有文件句柄，用完必须 Close。
 func NewWith(opts Options) (*Engine, error) {
+	persist, err := openPersist(opts.DataDir, opts.SyncInterval, opts.Logger)
+	if err != nil {
+		return nil, err
+	}
+
+	e, err := newEngineWith(opts, persist)
+	if err != nil {
+		// 构造失败就别把文件句柄漏在那。
+		if persist != nil {
+			_ = persist.log.Close()
+		}
+		return nil, err
+	}
+
+	// 重放必须在钩子生效的前提下进行——钩子内部会检查 replaying 标志，
+	// 因此重放期间不会把读到的记录又写回日志。
+	if persist != nil {
+		if err := persist.replay(e.idx, opts.Logger); err != nil {
+			_ = persist.log.Close()
+			return nil, err
+		}
+	}
+
+	return e, nil
+}
+
+func newEngineWith(opts Options, persist *persistState) (*Engine, error) {
 	idxOpts := opts.Index
 
 	if idxOpts.Analyzer == nil {
@@ -122,6 +182,13 @@ func NewWith(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("tsh: DictPath 与 Index.Analyzer 不能同时指定")
 	}
 
+	if persist != nil {
+		if idxOpts.OnApply != nil {
+			return nil, fmt.Errorf("tsh: 启用持久化时不能自行指定 Index.OnApply")
+		}
+		idxOpts.OnApply = persist.apply
+	}
+
 	idx := index.New(idxOpts)
 
 	hlOpts := opts.Highlight
@@ -135,7 +202,20 @@ func NewWith(opts Options) (*Engine, error) {
 		// 高亮必须复用索引的分析器，否则标注的位置会和检索命中的位置对不上。
 		hl:    highlight.New(idx.Analyzer(), hlOpts),
 		popts: opts.Parser,
+
+		persist: persist,
 	}, nil
+}
+
+// Close 停止后台刷盘、做最后一次 fsync 并关闭持久化日志。可重复调用。
+//
+// 没有启用持久化时它什么都不做。关闭之后的写请求会失败
+// （日志返回 ErrClosed），但读请求仍然可用。
+func (e *Engine) Close() error {
+	if e.persist == nil || e.persist.log == nil {
+		return nil
+	}
+	return e.persist.log.Close()
 }
 
 // Index 返回底层倒排索引，供需要更细粒度控制的调用方使用。

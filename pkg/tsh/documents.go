@@ -15,7 +15,13 @@ type Document struct {
 // 明确的 409，而不是无声无息地覆盖掉别人的数据。
 //
 // 检查与写入在索引的同一把写锁内完成，因此不存在并发下的 TOCTOU 窗口。
+//
+// 启用持久化时，日志追加与索引写入在同一把写锁内完成：返回 nil
+// 表示这次写**已经进入日志**，重启后仍然存在。
 func (e *Engine) Create(doc Document) error {
+	if err := e.persist.check(); err != nil {
+		return err
+	}
 	_, err := e.idx.Add(doc.ID, doc.Fields)
 	return err
 }
@@ -27,6 +33,9 @@ func (e *Engine) Create(doc Document) error {
 //
 // 覆盖是**整体替换**：旧版本独有的词条会被完整摘除，不会留下幽灵命中。
 func (e *Engine) Upsert(doc Document) (created bool, err error) {
+	if err := e.persist.check(); err != nil {
+		return false, err
+	}
 	_, created, err = e.idx.Upsert(doc.ID, doc.Fields)
 	return created, err
 }
@@ -35,6 +44,9 @@ func (e *Engine) Upsert(doc Document) (created bool, err error) {
 //
 // 文档不存在时返回 index.ErrDocumentNotFound。
 func (e *Engine) Delete(id string) error {
+	if err := e.persist.check(); err != nil {
+		return err
+	}
 	return e.idx.Delete(id)
 }
 
