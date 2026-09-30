@@ -34,7 +34,11 @@ param(
     [string]$Package = './...',
 
     # Force the Go build cache to this directory. Empty means auto-detect.
-    [string]$CacheDir = ''
+    [string]$CacheDir = '',
+
+    # Optional module proxy, e.g. https://goproxy.cn,direct. Empty leaves
+    # GOPROXY untouched. Needed only when new modules must be downloaded.
+    [string]$GoProxy = ''
 )
 
 $ErrorActionPreference = 'Continue'
@@ -114,21 +118,51 @@ Write-Host "using $goVersion" -ForegroundColor DarkGray
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
-if ($CacheDir) {
-    New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
-    $env:GOCACHE = $CacheDir
-    Write-Host "GOCACHE -> $CacheDir (forced)" -ForegroundColor DarkGray
-} elseif (-not $env:GOCACHE) {
-    $default = (& $GoExe env GOCACHE 2>&1 | Out-String).Trim()
-    if (Test-UsableDirectory $default) {
-        Write-Host "GOCACHE -> $default" -ForegroundColor DarkGray
-    } else {
-        $fallback = Join-Path $repoRoot '.gocache'
-        New-Item -ItemType Directory -Path $fallback -Force | Out-Null
-        $env:GOCACHE = $fallback
-        Write-Host "GOCACHE -> $fallback" -ForegroundColor Yellow
-        Write-Host '    (default cache is not writable here, likely a filesystem sandbox)' -ForegroundColor Yellow
+# Redirect a Go cache directory into the workspace when the default location is
+# not writable. A workspace-write sandbox only allows writes under the repo, so
+# both the build cache and the module cache need this treatment.
+function Set-GoCache {
+    param([string]$Name, [string]$Fallback)
+
+    if ($CacheDir -and $Name -eq 'GOCACHE') {
+        New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
+        [Environment]::SetEnvironmentVariable($Name, $CacheDir)
+        Write-Host "$Name -> $CacheDir (forced)" -ForegroundColor DarkGray
+        return
     }
+
+    if ([Environment]::GetEnvironmentVariable($Name)) {
+        Write-Host "$Name -> $([Environment]::GetEnvironmentVariable($Name))" -ForegroundColor DarkGray
+        return
+    }
+
+    $default = (& $GoExe env $Name 2>&1 | Out-String).Trim()
+    if ($default -and (Test-UsableDirectory $default)) {
+        Write-Host "$Name -> $default" -ForegroundColor DarkGray
+        return
+    }
+
+    New-Item -ItemType Directory -Path $Fallback -Force | Out-Null
+    [Environment]::SetEnvironmentVariable($Name, $Fallback)
+    Write-Host "$Name -> $Fallback" -ForegroundColor Yellow
+    Write-Host "    (default $Name is not writable here, likely a filesystem sandbox)" -ForegroundColor Yellow
+}
+
+Set-GoCache -Name 'GOCACHE' -Fallback (Join-Path $repoRoot '.gocache')
+
+# The module cache needs the same treatment: with third-party deps in play the
+# build reads it, and the default lives outside the repo (%GOPATH%\pkg\mod).
+Set-GoCache -Name 'GOMODCACHE' -Fallback (Join-Path $repoRoot '.gocache\mod')
+
+# Pass -GoProxy when new modules must be downloaded, e.g.
+#   scripts/check.ps1 -GoProxy https://goproxy.cn,direct
+# proxy.golang.org is unreachable from this network; the mirrors work.
+# GOSUMDB is disabled alongside it because sumdb writes to %GOPATH%\pkg\sumdb,
+# which a workspace-write sandbox rejects.
+if ($GoProxy) {
+    [Environment]::SetEnvironmentVariable('GOPROXY', $GoProxy)
+    [Environment]::SetEnvironmentVariable('GOSUMDB', 'off')
+    Write-Host "GOPROXY -> $GoProxy" -ForegroundColor DarkGray
 }
 
 $goroot = (& $GoExe env GOROOT | Out-String).Trim()
@@ -139,12 +173,23 @@ if (-not (Test-Path $gofmt)) {
 
 # gofmt -l exits 0 even when it lists unformatted files, so its output must be
 # inspected instead of its exit code.
+#
+# Do NOT run `gofmt -l .`: the module cache now lives inside the repo
+# (.gocache/mod) and gofmt does not skip dot-directories, so it would report
+# third-party sources as our formatting failures. Ask Go for this module's own
+# package directories instead.
 Write-Host '==> gofmt -l (formatting)' -ForegroundColor Cyan
-$unformatted = & $gofmt -l .
-if ($unformatted) {
-    Write-Host '    not formatted:' -ForegroundColor Red
-    $unformatted | ForEach-Object { Write-Host "      $_" }
+$pkgDirs = @(& $GoExe list -f '{{.Dir}}' ./... 2>$null | Where-Object { $_ })
+if ($pkgDirs.Count -eq 0) {
+    Write-Host '    FAILED (go list returned no package directories)' -ForegroundColor Red
     $global:failed += 'gofmt'
+} else {
+    $unformatted = & $gofmt -l $pkgDirs
+    if ($unformatted) {
+        Write-Host '    not formatted:' -ForegroundColor Red
+        $unformatted | ForEach-Object { Write-Host "      $_" }
+        $global:failed += 'gofmt'
+    }
 }
 
 Invoke-Checked 'go vet' { & $GoExe vet $Package }

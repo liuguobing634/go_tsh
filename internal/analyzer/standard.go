@@ -77,19 +77,34 @@ func NewStandardWith(opts StandardOptions) *StandardAnalyzer {
 
 // Analyze 实现 Analyzer。
 func (a *StandardAnalyzer) Analyze(text string) []Token {
+	tokens, _ := a.analyzeInto(text, 0, nil, 0)
+	return tokens
+}
+
+// analyzeInto 把 text 的分析结果**追加**到 tokens 上，返回新的切片与位置计数。
+//
+// base 是 text 在更大文本中的字节偏移，用于把 Token 的 Start/End 换算到
+// 原文坐标系；pos 是起始位置计数。
+//
+// 这个入口是给混合分析器准备的：中文分析器需要把「非汉字段」交给这套
+// 英文规则处理，同时保持位置与偏移在整段文本上连续。
+//
+// 返回值里的 pos 是必需的——被过滤掉的词条同样占位，
+// 只看返回的 tokens 推不出到底消耗了多少个位置。
+func (a *StandardAnalyzer) analyzeInto(text string, base int, tokens []Token, pos uint32) ([]Token, uint32) {
 	if text == "" {
-		return nil
+		return tokens, pos
 	}
 
-	// 先整体转成 []rune：撇号需要向后看一个字符，rune 切片让逻辑清晰得多。
-	tokens := make([]Token, 0, estimateTokens(len(text)))
+	if tokens == nil {
+		tokens = make([]Token, 0, estimateTokens(len(text)))
+	}
 
 	// word 复用同一块底层数组，flush 后通过 word[:0] 归零，避免反复分配。
 	var (
 		word      []rune
 		wordStart int // 当前词条的起始字节偏移
 		wordEnd   int // 当前词条结束后的字节偏移
-		pos       uint32
 	)
 
 	// flush 为一个词条收尾。无论是否保留，pos 都会前进，
@@ -103,12 +118,12 @@ func (a *StandardAnalyzer) Analyze(text string) []Token {
 		start, end := wordStart, wordEnd
 		word = word[:0]
 
-		if n >= a.minTokenLen && !a.isStopword(term) {
+		if a.keep(term, n) {
 			tokens = append(tokens, Token{
 				Term:     term,
 				Position: pos,
-				Start:    start,
-				End:      end,
+				Start:    base + start,
+				End:      base + end,
 			})
 		}
 		pos++
@@ -126,8 +141,8 @@ func (a *StandardAnalyzer) Analyze(text string) []Token {
 			tokens = append(tokens, Token{
 				Term:     string(unicode.ToLower(r)),
 				Position: pos,
-				Start:    i,
-				End:      i + size,
+				Start:    base + i,
+				End:      base + i + size,
 			})
 			pos++
 			i += size
@@ -154,7 +169,7 @@ func (a *StandardAnalyzer) Analyze(text string) []Token {
 	}
 	flush()
 
-	return tokens
+	return tokens, pos
 }
 
 // hasWordRuneAt 报告 text[i:] 处的 rune 是否能作为词条字符。
@@ -174,6 +189,15 @@ func (a *StandardAnalyzer) isStopword(term string) bool {
 	}
 	_, ok := a.stopwords[term]
 	return ok
+}
+
+// keep 报告一个已归一化的词条是否应当进入倒排索引。
+//
+// n 是词条的 rune 数（不是字节数——中文词按字节算会得出错误结论）。
+// 混用分析器时这条规则必须只有一处实现，否则中英文两侧的过滤口径
+// 迟早会走偏。
+func (a *StandardAnalyzer) keep(term string, n int) bool {
+	return n >= a.minTokenLen && !a.isStopword(term)
 }
 
 // isWordRune 报告 r 是否可以作为词条的组成部分。

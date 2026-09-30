@@ -20,11 +20,15 @@ help: ## 显示所有可用目标
 
 .PHONY: fmt
 fmt: ## 就地格式化代码
-	$(GOFMT) -w .
+	@dirs="$$($(GO) list -f '{{.Dir}}' $(PKG))"; \
+	if [ -z "$$dirs" ]; then echo "go list 没有返回任何包目录"; exit 1; fi; \
+	$(GOFMT) -w $$dirs
 
 .PHONY: fmt-check
 fmt-check: ## 校验格式，不修改文件（CI 门禁）
-	@out=$$($(GOFMT) -l .); \
+	@dirs="$$($(GO) list -f '{{.Dir}}' $(PKG))"; \
+	if [ -z "$$dirs" ]; then echo "go list 没有返回任何包目录"; exit 1; fi; \
+	out=$$($(GOFMT) -l $$dirs); \
 	if [ -n "$$out" ]; then \
 		echo "以下文件未格式化："; echo "$$out"; exit 1; \
 	fi
