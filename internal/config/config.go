@@ -38,6 +38,19 @@ type Config struct {
 	WriteTimeout  time.Duration // HTTP 写超时
 	IdleTimeout   time.Duration // HTTP 空闲连接超时
 	ShutdownGrace time.Duration // 优雅关闭等待上限
+
+	// Analyzer 选择文本分析器："standard"（默认，英文/数字）或 "chinese"
+	// （汉字走词典分词，英文部分仍用 standard 的规则）。
+	Analyzer string
+
+	// DictPath 是中文分析器追加的自定义词典文件；analyzer 为 chinese 时生效。
+	//
+	// 用于补充内嵌词典没有收录的领域词，否则它们会被切碎。
+	DictPath string
+
+	// NoSubWords 关闭中文的子词扩展：索引更小、写入更快，但只能整词匹配。
+	// 仅在 analyzer 为 chinese 时生效。
+	NoSubWords bool
 }
 
 // Default 返回一套可直接用于本地开发的默认配置。
@@ -54,8 +67,15 @@ func Default() Config {
 		WriteTimeout:  30 * time.Second,
 		IdleTimeout:   60 * time.Second,
 		ShutdownGrace: 10 * time.Second,
+		Analyzer:      AnalyzerStandard,
 	}
 }
+
+// 支持的分析器名称。
+const (
+	AnalyzerStandard = "standard"
+	AnalyzerChinese  = "chinese"
+)
 
 // Load 解析 args（不含程序名）与环境变量，返回校验通过的最终配置。
 //
@@ -80,6 +100,9 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 	fs.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "HTTP 写超时")
 	fs.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "HTTP 空闲连接超时")
 	fs.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace, "优雅关闭等待上限")
+	fs.StringVar(&cfg.Analyzer, "analyzer", cfg.Analyzer, "文本分析器：standard|chinese")
+	fs.StringVar(&cfg.DictPath, "dict", cfg.DictPath, "中文自定义词典文件（每行一个词）")
+	fs.BoolVar(&cfg.NoSubWords, "no-sub-words", cfg.NoSubWords, "关闭中文子词扩展")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, fmt.Errorf("解析命令行参数: %w", err)
@@ -128,6 +151,26 @@ func (c Config) Validate() error {
 
 	if strings.TrimSpace(c.Addr) == "" {
 		return fmt.Errorf("addr 不能为空")
+	}
+
+	switch c.Analyzer {
+	case AnalyzerStandard, AnalyzerChinese:
+	default:
+		return fmt.Errorf("非法的 analyzer %q，可选 %s|%s",
+			c.Analyzer, AnalyzerStandard, AnalyzerChinese)
+	}
+
+	// dict 与 no-sub-words 只在中文分析器下有意义。显式指出比静默忽略要好：
+	// 用户多半是忘了同时加 -analyzer chinese。
+	if c.Analyzer != AnalyzerChinese {
+		if c.DictPath != "" {
+			return fmt.Errorf("指定了 dict 但 analyzer 是 %q，请同时设置 -analyzer %s",
+				c.Analyzer, AnalyzerChinese)
+		}
+		if c.NoSubWords {
+			return fmt.Errorf("指定了 no-sub-words 但 analyzer 是 %q，请同时设置 -analyzer %s",
+				c.Analyzer, AnalyzerChinese)
+		}
 	}
 
 	positiveInts := []struct {

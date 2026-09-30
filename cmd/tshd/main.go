@@ -5,10 +5,15 @@
 //	tshd -addr :8080 -log-level info
 //	tshd -import ./testdata/corpus          # 启动时导入目录里的文本文件
 //	tshd -generate 100000                   # 启动时合成 10 万篇语料（压测用）
+//	tshd -analyzer chinese                  # 汉字走词典分词
+//	tshd -analyzer chinese -dict ./words.txt # 再追加领域词
 //
 // 每个命令行参数都可被同名环境变量覆盖（前缀 TSH_、中划线转下划线并大写），
 // 例如 -query-timeout 对应 TSH_QUERY_TIMEOUT。
 // 命令行显式指定的值优先级最高，不会被环境变量覆盖。
+//
+// 注意：-analyzer 会决定索引里存的是什么词条，因此**换分析器必须重建索引**。
+// 内存索引在进程重启时重建，改这个参数后重启即可。
 package main
 
 import (
@@ -23,7 +28,6 @@ import (
 
 	"github.com/liuguobing/go_tsh/internal/config"
 	"github.com/liuguobing/go_tsh/internal/httpapi"
-	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
 
 // version 由 -ldflags "-X main.version=..." 在构建时注入。
@@ -46,7 +50,13 @@ func run(args []string) int {
 	logger := newLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 
-	engine := tsh.New()
+	// 这些上限此前只被解析与校验，从未接进引擎——用户改了
+	// -max-doc-tokens / -max-doc-fields / -max-query-terms 不会有任何效果。
+	engine, err := newEngine(cfg)
+	if err != nil {
+		logger.Error("创建引擎失败", "err", err)
+		return 1
+	}
 
 	// 语料导入必须发生在监听之前：否则客户端可能在索引还没灌完时
 	// 就查到一个空索引，得到「服务在跑但搜不到东西」的困惑。

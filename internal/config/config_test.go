@@ -111,3 +111,67 @@ func TestEnvKey(t *testing.T) {
 		}
 	}
 }
+
+func TestAnalyzerConfig(t *testing.T) {
+	t.Run("默认是 standard", func(t *testing.T) {
+		cfg, err := Load(nil, mapEnv(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Analyzer != AnalyzerStandard {
+			t.Errorf("默认 analyzer = %q, want %q", cfg.Analyzer, AnalyzerStandard)
+		}
+		if cfg.DictPath != "" {
+			t.Errorf("默认 dict 应为空，实际 %q", cfg.DictPath)
+		}
+		if cfg.NoSubWords {
+			t.Error("默认不应关闭子词")
+		}
+	})
+
+	t.Run("可选 chinese", func(t *testing.T) {
+		cfg, err := Load([]string{"-analyzer", "chinese"}, mapEnv(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Analyzer != AnalyzerChinese {
+			t.Errorf("analyzer = %q, want %q", cfg.Analyzer, AnalyzerChinese)
+		}
+	})
+
+	t.Run("环境变量可设置", func(t *testing.T) {
+		cfg, err := Load(nil, mapEnv(map[string]string{"TSH_ANALYZER": "chinese"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Analyzer != AnalyzerChinese {
+			t.Errorf("analyzer = %q, want %q", cfg.Analyzer, AnalyzerChinese)
+		}
+	})
+
+	// 非法值与「设了中文专属参数却没开中文」都必须报错。
+	// 静默忽略是最糟的处理：用户以为配置生效了，实际没有。
+	t.Run("非法值报错", func(t *testing.T) {
+		if _, err := Load([]string{"-analyzer", "martian"}, mapEnv(nil)); err == nil {
+			t.Error("未知 analyzer 应当报错")
+		}
+	})
+
+	t.Run("dict 需要 chinese", func(t *testing.T) {
+		if _, err := Load([]string{"-dict", "words.txt"}, mapEnv(nil)); err == nil {
+			t.Error("只给 dict 不给 analyzer 应当报错")
+		}
+		if _, err := Load([]string{"-analyzer", "chinese", "-dict", "words.txt"}, mapEnv(nil)); err != nil {
+			t.Errorf("analyzer=chinese 时 dict 应当被接受: %v", err)
+		}
+	})
+
+	t.Run("no-sub-words 需要 chinese", func(t *testing.T) {
+		if _, err := Load([]string{"-no-sub-words"}, mapEnv(nil)); err == nil {
+			t.Error("只给 no-sub-words 不给 analyzer 应当报错")
+		}
+		if _, err := Load([]string{"-analyzer", "chinese", "-no-sub-words"}, mapEnv(nil)); err != nil {
+			t.Errorf("analyzer=chinese 时 no-sub-words 应当被接受: %v", err)
+		}
+	})
+}

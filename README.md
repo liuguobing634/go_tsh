@@ -1,19 +1,38 @@
 # go_tsh
 
-用 Go 从零实现的全文搜索服务：**单二进制、零第三方依赖、内存倒排索引、HTTP JSON API**。
+用 Go 从零实现的全文搜索服务：**单二进制、手写内存倒排索引、HTTP JSON API**。
 
-> 当前进度：**Phase 0–5 全部完成**。
+> 当前进度：**Phase 0–5 全部完成**，并已加入**中文分词与检索**。
 > 10 万篇规模下检索 P99 < 20ms；`make check`（含 `-race`）全绿。
 > 性能数据与压测记录见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，
+> 中文支持的实测对比与设计见 [docs/CHINESE.md](docs/CHINESE.md)，
 > 完整规划与选型理由见 [PLAN.md](PLAN.md)。
 
-## 特性（目标）
+> **依赖说明（相对原计划的修订）**
+>
+> 本项目原本以「零第三方依赖」为目标，Phase 0–5 也确实做到了。
+> 加入中文分词时引入了 **一个** 外部依赖：
+> [`github.com/go-ego/gse`](https://github.com/go-ego/gse)（纯 Go，仅间接依赖
+> `vcaesar/cedar`）。
+>
+> 取舍理由与代价：
+> - 换成 **CGO** 方案的 `gojieba` 会摧毁静态构建、scratch 镜像与四目标交叉编译矩阵，
+>   因此不采用；
+> - gse 经实测 `CGO_ENABLED=0 GOOS=linux` 构建通过，**静态交付形态保持不变**；
+> - 代价是**二进制从 6.71 MB 涨到 38.47 MB**（内嵌词典约 30 MB），
+>   以及 **108 MB 的内存基线**。
+>
+> 现在准确的表述是：**核心检索路径（索引、查询、打分、HTTP）零第三方依赖，
+> 只有中文分析器引入 gse**。不启用 `-analyzer chinese` 时，gse 的代码路径不会被走到。
+
+## 特性
 
 - 手写倒排索引，posting list 带 token 位置信息，支持短语查询
 - BM25 相关性排序（k1 = 1.2，b = 0.75）+ 小顶堆 Top-K
 - 布尔查询：`AND` / `OR` / `NOT`，以及 `-term` 排除语法
 - 文档增删改查、高亮片段
-- 标准库实现：`net/http`、`log/slog`、`encoding/json`——`go.mod` 无任何外部依赖
+- **中文检索**：词典分词 + 子词扩展（`-analyzer chinese`）
+- 标准库实现：`net/http`、`log/slog`、`encoding/json`
 
 ## 快速开始
 
@@ -63,6 +82,31 @@ curl.exe --noproxy "*" http://127.0.0.1:8080/api/v1/stats
 `-generate` 与 `-import` 可以同时使用。合成语料刻意做成**不均匀**的词频分布，
 理由见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
+### 中文检索
+
+```powershell
+./bin/tshd.exe -addr :8080 -analyzer chinese -import ./testdata/corpus
+```
+
+```powershell
+# "倒排索引" 会被切成「倒排」「索引」两个词
+curl.exe --noproxy "*" "http://127.0.0.1:8080/api/v1/search?q=%E5%80%92%E6%8E%92%E7%B4%A2%E5%BC%95"
+```
+
+领域词（如「倒排索引」「跳表」）如果内嵌词典没收录会被切碎，
+可以用自定义词典补充：
+
+```powershell
+./bin/tshd.exe -analyzer chinese -dict ./words.txt
+```
+
+`words.txt` 每行一个词，支持 `#` 注释，也接受 gse 的「词 词频 词性」格式。
+
+> **注意**：启动时加载约 108 MB 词典、耗时约 0.7 秒，
+> 二进制也会因为内嵌词典从 6.71 MB 涨到 38.47 MB。
+> 完整实测数据、两个分析器的真实差别、以及已知取舍见
+> **[docs/CHINESE.md](docs/CHINESE.md)**。
+
 ## 容器与 CI
 
 ```bash
@@ -70,14 +114,22 @@ docker build -f deploy/Dockerfile -t go_tsh .
 docker run --rm -p 8080:8080 go_tsh
 ```
 
-镜像基于 `scratch`：完全静态链接，最终只有 **7.03 MB**（实测），以 `nobody` 运行。
+镜像基于 `scratch`：完全静态链接，以 `nobody` 运行。
 代价是**不能 `docker exec` 进去排查**（容器里没有任何可执行文件），
 也没有 `HEALTHCHECK` 可写——请由编排层通过 HTTP 探 `/healthz`。
+
+> **镜像体积**：引入 gse 之前实测 **7.03 MB**；现在因为内嵌中文词典，
+> 二进制为 **38.47 MB**（linux/amd64，实测），镜像体积与之相当。
+> 若对体积敏感，`go build -tags ne` 可降到 **7.61 MB**，
+> 但词典不再内嵌，需要自行提供词典文件——当前代码走的是内嵌路径，
+> 切换过去需要额外改造。详见 [docs/CHINESE.md](docs/CHINESE.md)。
 
 CI 在 `.github/workflows/ci.yml`：Linux runner 上跑 `gofmt + go vet + go test -race`，
 外加一个四目标交叉编译矩阵（linux/amd64、linux/arm64、darwin/arm64、windows/amd64）。
 Linux 上 `-race` 不需要额外配置——`ubuntu-latest` 自带 gcc，`CGO_ENABLED` 默认为 1，
 与 Windows 上要手动装 MSYS2 完全不同。
+CI runner 能直连 `proxy.golang.org`，不需要镜像配置；
+但**首次构建会下载 gse 与 cedar**，因此 `go.sum` 必须入库（已在库中）。
 
 ## 性能
 
@@ -97,6 +149,9 @@ Linux 上 `-race` 不需要额外配置——`ubuntu-latest` 自带 gcc，`CGO_E
 | `-log-level` | `TSH_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `-import` | `TSH_IMPORT` | 空 | 启动时导入的语料目录（txt/md），**启动动作** |
 | `-generate` | `TSH_GENERATE` | `0` | 启动时合成的文档数，**压测用** |
+| `-analyzer` | `TSH_ANALYZER` | `standard` | `standard` / `chinese`，**换值必须重建索引** |
+| `-dict` | `TSH_DICT` | 空 | 中文自定义词典文件；需 `-analyzer chinese` |
+| `-no-sub-words` | `TSH_NO_SUB_WORDS` | `false` | 关闭中文子词扩展；需 `-analyzer chinese` |
 | `-max-body-bytes` | `TSH_MAX_BODY_BYTES` | `8388608` | 单请求体字节上限（8 MiB） |
 | `-max-doc-fields` | `TSH_MAX_DOC_FIELDS` | `32` | 单文档字段数上限 |
 | `-max-doc-tokens` | `TSH_MAX_DOC_TOKENS` | `100000` | 单文档 token 数上限 |
@@ -347,5 +402,35 @@ $env:GOCACHE = "$PWD\.gocache"
 writing stat cache: open C:\Users\<user>\go\pkg\mod\cache\...: Access is denied
 ```
 
-本项目零第三方依赖，构建与测试都不受影响，属噪音级警告。
-若将来引入依赖，把 `GOMODCACHE` 同样指向工作区内。
+引入 gse 之后**不能再忽略**这一条：模块缓存默认在 `%GOPATH%\pkg\mod`，
+在工作区之外，沙箱会拒绝写入。解决办法与 `GOCACHE` 相同——
+把 `GOMODCACHE` 指向工作区内：
+
+```powershell
+$env:GOMODCACHE = "$PWD\.gocache\mod"
+```
+
+`scripts/check.ps1` 已自动做这件事（会先探测默认可否写入）。
+
+### 拉取新依赖：代理必须换成国内镜像
+
+本机实测：
+
+| 目标 | 沙箱内 | 提权后 |
+| --- | --- | --- |
+| `https://www.baidu.com` | ❌ 连接失败 | ✅ |
+| `https://goproxy.cn/...` | ❌ 连接失败 | ✅ |
+| `https://proxy.golang.org/...` | ❌ | ❌ **被墙** |
+
+两点结论：
+
+1. **沙箱会拦截 HTTPS 出网**（不只是文件系统），因此 `go get` / `go mod tidy`
+   需要提权执行；依赖进入工作区内的 `GOMODCACHE` 之后，沙箱内的普通构建就正常了。
+2. **`proxy.golang.org` 本身不可达**，必须换镜像：
+
+```powershell
+scripts/check.ps1 -GoProxy https://goproxy.cn,direct
+```
+
+`-GoProxy` 会同时设 `GOSUMDB=off`——sumdb 落在 `%GOPATH%\pkg\sumdb`，
+同样在工作区外，沙箱会拒绝写入。
