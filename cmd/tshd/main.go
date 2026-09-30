@@ -3,6 +3,8 @@
 // 用法示例：
 //
 //	tshd -addr :8080 -log-level info
+//	tshd -import ./testdata/corpus          # 启动时导入目录里的文本文件
+//	tshd -generate 100000                   # 启动时合成 10 万篇语料（压测用）
 //
 // 每个命令行参数都可被同名环境变量覆盖（前缀 TSH_、中划线转下划线并大写），
 // 例如 -query-timeout 对应 TSH_QUERY_TIMEOUT。
@@ -44,7 +46,16 @@ func run(args []string) int {
 	logger := newLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 
-	srv := httpapi.New(cfg, tsh.New(), logger)
+	engine := tsh.New()
+
+	// 语料导入必须发生在监听之前：否则客户端可能在索引还没灌完时
+	// 就查到一个空索引，得到「服务在跑但搜不到东西」的困惑。
+	if err := bootstrap(engine, cfg, logger); err != nil {
+		logger.Error("语料导入失败", "err", err)
+		return 1
+	}
+
+	srv := httpapi.New(cfg, engine, logger)
 
 	// 收到 Ctrl+C（Windows/Linux）或 SIGTERM（Linux）时取消 ctx。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

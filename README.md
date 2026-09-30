@@ -2,9 +2,10 @@
 
 用 Go 从零实现的全文搜索服务：**单二进制、零第三方依赖、内存倒排索引、HTTP JSON API**。
 
-> 当前进度：**Phase 4（HTTP 接口）已完成**，下一步 Phase 5（工程化交付）。
+> 当前进度：**Phase 0–5 全部完成**。
 > 10 万篇规模下检索 P99 < 20ms；`make check`（含 `-race`）全绿。
-> 完整的项目规划、选型理由与分阶段 TODO 见 [PLAN.md](PLAN.md)。
+> 性能数据与压测记录见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，
+> 完整规划与选型理由见 [PLAN.md](PLAN.md)。
 
 ## 特性（目标）
 
@@ -21,9 +22,25 @@
 ```powershell
 # 编译
 & "D:\Program Files\Go\bin\go.exe" build -o bin/tshd.exe ./cmd/tshd
+```
 
-# 启动
-./bin/tshd.exe -addr :8080 -log-level debug
+### 一键跑起来：导入自带的示例语料
+
+```powershell
+./bin/tshd.exe -addr :8080 -import ./testdata/corpus
+```
+
+启动日志会告诉你灌进去了什么：
+
+```
+{"level":"INFO","msg":"语料目录已读取","dir":".\\testdata\\corpus","files":6}
+{"level":"INFO","msg":"语料导入完成","docs":6,"terms":246,"index_mb":0.018,"elapsed":"0s"}
+```
+
+然后就能搜了：
+
+```powershell
+curl.exe --noproxy "*" "http://127.0.0.1:8080/api/v1/search?q=%22posting%20list%22&highlight=true"
 ```
 
 ```powershell
@@ -33,8 +50,42 @@ curl.exe --noproxy "*" http://127.0.0.1:8080/healthz
 
 # 索引统计
 curl.exe --noproxy "*" http://127.0.0.1:8080/api/v1/stats
-# {"docs":0,"terms":0,"avg_doc_len":0,"index_bytes":0}
+# {"docs":6,"terms":246,"fields":2,"avg_doc_len":64.17,"index_bytes":19549}
 ```
+
+### 压测用的合成语料
+
+```powershell
+# 直接在内存里合成 10 万篇（固定随机种子，可复现）
+./bin/tshd.exe -addr :8080 -generate 100000
+```
+
+`-generate` 与 `-import` 可以同时使用。合成语料刻意做成**不均匀**的词频分布，
+理由见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
+
+## 容器与 CI
+
+```bash
+docker build -f deploy/Dockerfile -t go_tsh .
+docker run --rm -p 8080:8080 go_tsh
+```
+
+镜像基于 `scratch`：完全静态链接，最终只有 **7.03 MB**（实测），以 `nobody` 运行。
+代价是**不能 `docker exec` 进去排查**（容器里没有任何可执行文件），
+也没有 `HEALTHCHECK` 可写——请由编排层通过 HTTP 探 `/healthz`。
+
+CI 在 `.github/workflows/ci.yml`：Linux runner 上跑 `gofmt + go vet + go test -race`，
+外加一个四目标交叉编译矩阵（linux/amd64、linux/arm64、darwin/arm64、windows/amd64）。
+Linux 上 `-race` 不需要额外配置——`ubuntu-latest` 自带 gcc，`CGO_ENABLED` 默认为 1，
+与 Windows 上要手动装 MSYS2 完全不同。
+
+## 性能
+
+10 万篇语料下的实测数据、方法说明、以及压测抓到的真实缺陷记录，
+见 **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)**。
+
+一句话版本：所有检索路径 P99 < 20 ms；并发检索约 5,100 req/s，
+并发写入约 19,400 req/s。
 
 ## 配置
 
@@ -44,6 +95,8 @@ curl.exe --noproxy "*" http://127.0.0.1:8080/api/v1/stats
 | --- | --- | --- | --- |
 | `-addr` | `TSH_ADDR` | `:8080` | HTTP 监听地址 |
 | `-log-level` | `TSH_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `-import` | `TSH_IMPORT` | 空 | 启动时导入的语料目录（txt/md），**启动动作** |
+| `-generate` | `TSH_GENERATE` | `0` | 启动时合成的文档数，**压测用** |
 | `-max-body-bytes` | `TSH_MAX_BODY_BYTES` | `8388608` | 单请求体字节上限（8 MiB） |
 | `-max-doc-fields` | `TSH_MAX_DOC_FIELDS` | `32` | 单文档字段数上限 |
 | `-max-doc-tokens` | `TSH_MAX_DOC_TOKENS` | `100000` | 单文档 token 数上限 |
@@ -148,7 +201,7 @@ make check
 ## 代码结构
 
 ```
-cmd/tshd/           # 守护进程入口：配置装配、日志、优雅关闭
+cmd/tshd/           # 守护进程入口：配置装配、语料导入、日志、优雅关闭
 internal/config/    # 配置解析（flag + env）
 internal/httpapi/   # HTTP 路由、中间件、DTO、错误映射 ✅ 全部端点
 internal/analyzer/  # 文本分析 ✅ StandardAnalyzer + 内置停用词表
@@ -156,7 +209,10 @@ internal/index/     # 倒排索引 ✅ InvertedIndex + View / PostingCursor
 internal/query/     # 查询 AST、解析器与执行器（归并求值 + BM25）✅
 internal/scoring/   # BM25 与 Top-K ✅
 internal/highlight/ # 高亮片段（HTML 转义 + 窗口截断）✅
+internal/corpus/    # 语料导入与合成（演示 / 压测用）✅
 pkg/tsh/            # 对外门面 Engine ✅ 文档读写 + 检索
+deploy/             # Dockerfile（多阶段 → scratch）
+docs/               # 性能报告
 ```
 
 依赖方向单向向内：`httpapi → tsh → {analyzer, query, index, scoring}`。

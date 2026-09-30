@@ -15,8 +15,20 @@ import (
 
 // Config 汇总服务的全部可调参数。
 type Config struct {
-	Addr          string        // HTTP 监听地址
-	LogLevel      string        // debug | info | warn | error
+	Addr     string // HTTP 监听地址
+	LogLevel string // debug | info | warn | error
+
+	// ImportDir 是启动时导入的语料目录；为空表示不导入。
+	//
+	// 这是给本地演示与压测用的**启动动作**，不是运行时接口。
+	ImportDir string
+
+	// GenerateDocs 是启动时合成的文档数；<= 0 表示不合成。
+	//
+	// 合成语料是为压测准备的：比起手工准备几十万篇文档，
+	// 一个开关就能得到可复现、且词频不均匀的语料。
+	GenerateDocs int
+
 	MaxBodyBytes  int64         // 单请求体字节上限
 	MaxDocFields  int           // 单文档字段数上限
 	MaxDocTokens  int           // 单文档 token 数上限
@@ -57,6 +69,8 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 
 	fs.StringVar(&cfg.Addr, "addr", cfg.Addr, "HTTP 监听地址")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "日志级别：debug|info|warn|error")
+	fs.StringVar(&cfg.ImportDir, "import", cfg.ImportDir, "启动时导入的语料目录（txt/md）")
+	fs.IntVar(&cfg.GenerateDocs, "generate", cfg.GenerateDocs, "启动时合成的文档数（压测用）")
 	fs.Int64Var(&cfg.MaxBodyBytes, "max-body-bytes", cfg.MaxBodyBytes, "单请求体字节上限")
 	fs.IntVar(&cfg.MaxDocFields, "max-doc-fields", cfg.MaxDocFields, "单文档字段数上限")
 	fs.IntVar(&cfg.MaxDocTokens, "max-doc-tokens", cfg.MaxDocTokens, "单文档 token 数上限")
@@ -129,6 +143,11 @@ func (c Config) Validate() error {
 		if p.val <= 0 {
 			return fmt.Errorf("%s 必须为正数，当前为 %d", p.name, p.val)
 		}
+	}
+
+	// generate 是唯一允许为 0 的数值项：0 表示不合成语料。
+	if c.GenerateDocs < 0 {
+		return fmt.Errorf("generate 不能为负数，当前为 %d", c.GenerateDocs)
 	}
 
 	positiveDurations := []struct {

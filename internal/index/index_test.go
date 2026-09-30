@@ -588,6 +588,78 @@ func assertSortedQuiet(t *testing.T, postings []Posting) {
 	}
 }
 
+// 内存估算必须是增量记账的：Stats() 早先每次请求都全量遍历一遍索引，
+// 10 万篇下 p50 高达 105ms，作为监控端点完全不可用。
+func TestIncrementalBytesAccounting(t *testing.T) {
+	ix := newTestIndex(t)
+
+	if got := ix.bytes; got != 0 {
+		t.Fatalf("空索引的增量记账 = %d, want 0", got)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := ix.Add(fmt.Sprintf("d%d", i), map[string]string{
+			"title": "alpha beta",
+			"body":  "gamma delta epsilon zeta",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	afterAdd := ix.bytes
+	if afterAdd <= 0 {
+		t.Fatalf("写入后增量记账 = %d, 应当为正", afterAdd)
+	}
+	if got := ix.Stats().IndexBytes; got < afterAdd {
+		t.Errorf("Stats().IndexBytes = %d, 不应小于增量记账 %d", got, afterAdd)
+	}
+
+	for i := 0; i < 5; i++ {
+		if err := ix.Delete(fmt.Sprintf("d%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 全部删除后，posting、term key、文档表的记账都应当精确抵消。
+	if got := ix.bytes; got != 0 {
+		t.Fatalf("全部删除后增量记账应归零，实际 %d（差值 %d）", got, got)
+	}
+}
+
+// 覆盖更新同样要精确记账：旧版本的占用必须被完整扣除，
+// 否则反复覆盖会让内存估算单调虚高。
+func TestBytesAccountingOnUpdate(t *testing.T) {
+	ix := newTestIndex(t)
+
+	if _, err := ix.Add("d1", map[string]string{"body": "alpha beta gamma"}); err != nil {
+		t.Fatal(err)
+	}
+	afterAdd := ix.bytes
+
+	// 用同样内容覆盖：记账应当回到同一个值。
+	if _, err := ix.Update("d1", map[string]string{"body": "alpha beta gamma"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ix.bytes; got != afterAdd {
+		t.Errorf("同内容覆盖后记账 = %d, want %d", got, afterAdd)
+	}
+
+	// 换成内容更长的版本：记账应当变大。
+	if _, err := ix.Update("d1", map[string]string{"body": "alpha beta gamma delta epsilon"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ix.bytes; got <= afterAdd {
+		t.Errorf("内容变长后记账 = %d, 应大于 %d", got, afterAdd)
+	}
+
+	if err := ix.Delete("d1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ix.bytes; got != 0 {
+		t.Errorf("删除后记账 = %d, want 0", got)
+	}
+}
+
 // ---------------------------------------------------------------- 基准测试
 
 func BenchmarkAddDocument(b *testing.B) {

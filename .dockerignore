@@ -1,0 +1,25 @@
+# 构建上下文排除项。
+#
+# 没有这个文件的话，docker build 会把整个工作目录（含 .gocache 里几百 MB
+# 的构建缓存、bin/ 里的二进制、以及 .git）打包发给 daemon，
+# 既慢又污染层缓存。
+
+# 版本控制与 CI 配置
+.git/
+.github/
+
+# 构建产物
+bin/
+.gocache/
+.smoke/
+*.exe
+
+# 测试与覆盖率
+*.out
+coverage.out
+coverage.html
+
+# 其它
+*.log
+.DS_Store
+Thumbs.db

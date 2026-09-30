@@ -76,6 +76,14 @@ type InvertedIndex struct {
 
 	nextID      DocID
 	totalTokens uint64
+
+	// bytes 是索引常驻内存的**增量记账**结果。
+	//
+	// 早先是在 Stats() 里全量遍历算一遍。10 万篇语料下每次请求要跑
+	// 约 1500 万次循环，实测 /api/v1/stats 的 p50 高达 105ms、p99 401ms——
+	// 一个监控端点做成 O(索引规模)，在大索引上根本不能用。
+	// 改成在写入路径上加减之后，Stats 变成 O(1)。
+	bytes int64
 }
 
 // New 创建一个空索引。
@@ -297,6 +305,7 @@ func (ix *InvertedIndex) insertLocked(p *preparedDoc) DocID {
 	}
 
 	ix.totalTokens += uint64(p.total)
+	ix.bytes += docBytes(ix.docs[id])
 	return id
 }
 
@@ -350,6 +359,7 @@ func (ix *InvertedIndex) insertFieldLocked(field string, id DocID, tokens []anal
 		if pl == nil {
 			pl = &PostingList{}
 			ix.terms[key] = pl
+			ix.bytes += termKeyBytes(key)
 		}
 
 		// DocID 单调递增，且删除会整条摘除，因此 append 即保持有序。
@@ -359,6 +369,7 @@ func (ix *InvertedIndex) insertFieldLocked(field string, id DocID, tokens []anal
 			Positions: positions,
 		})
 		pl.DF++
+		ix.bytes += postingBytes(len(positions))
 
 		i = j
 	}
@@ -383,6 +394,7 @@ func (ix *InvertedIndex) removeLocked(doc *Document) {
 		}
 	}
 
+	ix.bytes -= docBytes(doc)
 	delete(ix.docs, doc.ID)
 	delete(ix.byExternal, doc.External)
 	ix.totalTokens -= uint64(doc.TotalLen)
@@ -412,6 +424,8 @@ func (ix *InvertedIndex) removePostingLocked(key string, pl *PostingList, id Doc
 		return
 	}
 
+	ix.bytes -= postingBytes(len(pl.Postings[i].Positions))
+
 	pl.Postings = append(pl.Postings[:i], pl.Postings[i+1:]...)
 	if pl.DF > 0 {
 		pl.DF--
@@ -419,6 +433,7 @@ func (ix *InvertedIndex) removePostingLocked(key string, pl *PostingList, id Doc
 
 	if len(pl.Postings) == 0 {
 		delete(ix.terms, key)
+		ix.bytes -= termKeyBytes(key)
 	}
 }
 
@@ -589,43 +604,52 @@ func (ix *InvertedIndex) Stats() Stats {
 	if s.Docs > 0 {
 		s.AvgDocLen = float64(ix.totalTokens) / float64(s.Docs)
 	}
-	s.IndexBytes = ix.estimateBytesLocked()
+	s.IndexBytes = ix.bytes + ix.docFieldLensBytes()
 	return s
 }
 
-// estimateBytesLocked 粗略估算索引的常驻内存占用。调用方必须持锁。
+// 内存估算用的粗略常量。
 //
-// 只做量级估算：字符串按 len 计，容器按元素数与指针宽度计，
+// 只求量级可信：字符串按 len 计，容器按元素数与指针宽度计，
 // 不含 map 桶、分配器对齐、字符串去重等开销，因此结果偏保守。
-// 目的是给容量观测一个可信的数量级，而不是精确的内存核算。
-func (ix *InvertedIndex) estimateBytesLocked() int64 {
-	const (
-		postingSize     = 24 // DocID + TF + Positions 切片头
-		positionSize    = 4  // uint32
-		docFieldLenSize = 4  // int32
-		stringHeader    = 16
-	)
+const (
+	postingSizeBytes  = 24 // DocID + TF + Positions 切片头
+	positionSizeBytes = 4  // uint32
+	stringHeaderBytes = 16
+	docFieldLenBytes  = 8 + stringHeaderBytes // FieldLen map 的一个条目
+)
 
+// termKeyBytes 是扁平 term map 里一个 key 的占用。
+func termKeyBytes(key string) int64 {
+	return int64(len(key)) + stringHeaderBytes + postingSizeBytes
+}
+
+// postingBytes 是一条 posting 里 Positions 底层的占用。
+// Posting 结构体本身已经算在 termKeyBytes 的 postingSizeBytes 里。
+func postingBytes(positions int) int64 {
+	return int64(positions) * positionSizeBytes
+}
+
+// docBytes 是一篇文档在文档表里的占用。
+func docBytes(doc *Document) int64 {
+	n := int64(len(doc.External)) + stringHeaderBytes
+
+	for k, v := range doc.Fields {
+		n += int64(len(k)+len(v)) + 2*stringHeaderBytes
+	}
+	n += int64(len(doc.FieldLen)) * docFieldLenBytes
+
+	return n
+}
+
+// docFieldLensBytes 是稠密词长切片的总占用。
+//
+// 它按字段分配、随 DocID 增长，且删除时不会缩容，
+// 因此只能在 Stats 里按当前长度汇总，无法完全增量维护。
+func (ix *InvertedIndex) docFieldLensBytes() int64 {
 	var n int64
-
-	for key, pl := range ix.terms {
-		n += int64(len(key)) + stringHeader + postingSize
-		for i := range pl.Postings {
-			n += int64(len(pl.Postings[i].Positions)) * positionSize
-		}
-	}
-
 	for _, lens := range ix.docFieldLens {
-		n += int64(len(lens)) * docFieldLenSize
+		n += int64(len(lens)) * 4
 	}
-
-	for _, doc := range ix.docs {
-		n += int64(len(doc.External)) + stringHeader
-		for k, v := range doc.Fields {
-			n += int64(len(k)+len(v)) + 2*stringHeader
-		}
-		n += int64(len(doc.FieldLen)) * (stringHeader + 8)
-	}
-
 	return n
 }

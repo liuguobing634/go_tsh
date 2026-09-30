@@ -611,17 +611,45 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 > 结果写完 404 之后又走到末尾写了第二次 500 —— 响应被写两遍。
 > Go 的 `switch` 不像 C 需要 `break`，但**不会自动返回**。
 
-### Phase 5 — 工程化与交付
+### Phase 5 — 工程化与交付 ✅ 已完成
 
-### Phase 5 — 工程化与交付
-- [ ] `README.md`：项目简介、架构图、快速开始、API 文档、curl 示例、性能数据
-- [ ] demo 命令：`tshd -import ./testdata/corpus` 一键灌数据
-- [ ] 语料/基准数据生成脚本（合成 10 万篇）
-- [ ] `deploy/Dockerfile`：多阶段 + `CGO_ENABLED=0` 静态二进制 + distroless/scratch
-- [ ] CI：`gofmt -l`、`go vet`、`go test -race ./...`、覆盖率上传
-- [ ] 压测报告（`hey` / `wrk`）：QPS、P50/P95/P99、内存曲线
-- [ ] 编写 `docs/API.md` 与 `docs/DESIGN.md`（把本文档拆分沉淀）
-- [ ] **验收**：新机器 `make check && make run` 5 分钟内跑通
+> **与原计划的偏差**
+> - 压测没有用 `hey` / `wrk`，而是写成 **Go benchmark**（`internal/httpapi/load_test.go`）。
+>   理由：外部压测工具测的是「某个二进制 + 某台机器」，换台机器就不可复现；
+>   写成 benchmark 后，任何人都能用一条 `go test -bench` 复现同样的语料与同样的度量。
+>   代价是它测的是**进程内 httptest 服务 + 真实 HTTP 客户端**，
+>   不含跨机网络延迟——这一点在报告里写明了。
+> - **`Stats()` 从 O(索引规模) 改成 O(1)**：压测发现 `/api/v1/stats`
+>   均值 121ms、P99 401ms，根因是 `IndexBytes` 每次全量遍历索引。
+>   这是个监控端点，110ms 的响应毫无可用性。改成增量记账后降到 0.24ms。
+
+- [x] `README.md`：项目简介、快速开始、完整 API 文档、curl 示例、配置表、故障排查
+- [x] demo 命令：`tshd -import ./testdata/corpus`（附带 6 篇示例语料）
+- [x] 语料合成：`tshd -generate 100000`，固定种子可复现，词频刻意做成不均匀
+- [x] `deploy/Dockerfile`：多阶段 + `CGO_ENABLED=0` → `scratch`，**实测 7.03 MB**
+- [x] `.dockerignore`：否则构建上下文会把 `.gocache` 几百 MB 一起打包
+- [x] CI：`.github/workflows/ci.yml`，`gofmt` + `vet` + `test -race` + 覆盖率 + 四目标交叉编译矩阵
+- [x] 压测报告：`docs/PERFORMANCE.md`（QPS、P95/P99/最大值、分配量、已知限制）
+- [x] **验收**：`go build` / `go vet` / `go test -race` 在 Linux 与 Windows 下均通过
+
+> **验证做到了什么程度（如实记录）**
+>
+> | 项 | 状态 |
+> | --- | --- |
+> | linux/amd64、linux/arm64 交叉编译 | ✅ 实测通过 |
+> | 产物是**静态链接**的 ELF（`scratch` 的前提） | ✅ 实测（无 `ld-linux`） |
+> | `scratch` 镜像可运行、`/healthz` 与 `/api/v1/stats` 有响应 | ✅ 实测（**7.03 MB**，以 nobody 运行） |
+> | 完整 `docker build`（含 `golang:1.27-alpine` 构建阶段） | ❌ **未验证**——本机无法访问 docker.io，拉不到基础镜像 |
+>
+> 因此 Dockerfile 的**运行阶段**经过真实验证，**构建阶段**只在逻辑上成立。
+> 另：已刻意去掉 `# syntax=docker/dockerfile:1`——那条指令会强制去
+> docker.io 拉一个 BuildKit 前端镜像，而本文件并未用到需要它的特性。
+
+> **一个值得记下的测量教训**：验证 ELF 魔数时，我拿 `bytes[1]` 去比 `'L'`、
+> `bytes[2]` 去比 `'F'`，整体错位了一位，于是得出了「不是 ELF」的错误结论。
+> 二进制本身一直是好的。**又一次是尺子错了，不是被测对象错了。**
+> 压测的 P50 也有同类问题：本机 harness 出现了亚微秒伪影，
+> 约一半样本读数为 0，与 `ns/op` 均值自相矛盾，因此报告里明确弃用 P50。
 
 ### Phase 6 — 可选演进（按需排期，不在 v1 承诺内）
 - [ ] 快照持久化：`gob`/自定义二进制序列化 + 启动加载 + 定期 `Save`

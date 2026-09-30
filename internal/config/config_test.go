@@ -83,6 +83,7 @@ func TestLoadInvalid(t *testing.T) {
 		{"环境变量非法时长", nil, map[string]string{"TSH_QUERY_TIMEOUT": "3 秒"}},
 		{"上限为负", []string{"-max-query-terms", "-1"}, nil},
 		{"上限为零", []string{"-max-doc-fields", "0"}, nil},
+		{"合成文档数为负", []string{"-generate", "-1"}, nil},
 		{"地址为空白", []string{"-addr", "   "}, nil},
 		{"超时为负", []string{"-read-timeout", "-1s"}, nil},
 		{"未知参数", []string{"-nope"}, nil},
