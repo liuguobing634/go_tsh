@@ -470,9 +470,26 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 > 关键观察：**只有短语查询需要 `Positions`**。普通词条查询拿到 `(DocID, TF)`
 > 就够了，为它们拷贝位置信息是纯粹的浪费。
 
-- [ ] 先实现零拷贝 `ScanPostings`，并用基准证明查询路径分配量降到接近 0
-- [ ] Query AST：`TermQuery` / `PhraseQuery` / `BooleanQuery{Must,Should,MustNot}`
-- [ ] `q` 字符串解析器：bare term、`"phrase"`、`-neg`、`AND`/`OR`/`NOT`、括号（可选）
+- [x] **零拷贝扫描已完成 —— 效果远超预期**
+
+      实现方式是 `View`：把整次检索放进**同一把读锁**，既拿到一致快照又保持零拷贝。
+      比原计划的裸 `ScanPostings` 更正确——裸接口各自持锁，两次调用之间
+      可能插入写操作，AND 查询会看到「文档 A 在前一个词条的列表里、
+      却不在后一个里」这种自相矛盾的状态。
+
+      | 基准（1 万篇命中同一词条） | ns/op | B/op | allocs/op |
+      | --- | --- | --- | --- |
+      | `PostingsCopy`（Phase 2 旧路径） | 357,658 | 448,645 | 10,002 |
+      | `ViewScan` | **28,007** | **8** | **1** |
+      | `ViewScanPhrase` | **19,044** | **8** | **1** |
+
+      **快 12.8 倍，分配次数从 10002 降到 1**，P99 预算的威胁解除。
+      （`ViewScanPhrase` 反而更快，是因为 `ScanIDs` 多套了一层闭包。）
+- [x] Query AST：`Term` / `Phrase` / `Bool{Must,Should,MustNot}`
+- [x] `q` 字符串解析器：bare term、`"phrase"`、`-neg`、`NOT`、`AND`/`OR`、括号、
+      转义引号；子句数上限（默认 64，短语按单词数计入）防查询串打爆内存
+- [x] **解析器不做分词**：只产出语法树，原始文本原样保留。
+      分词由执行阶段用索引自己的 Analyzer 完成，从根本上杜绝两侧归一化不一致
 - [ ] **query 与 index 共用同一 Analyzer**（用 `Index().Analyzer()` 取）
 - [ ] posting list 归并：有序求交、求并（双指针）
 - [ ] 短语查询：**必须在单个字段内**判定位置连续性——各字段位置都从 0 开始，

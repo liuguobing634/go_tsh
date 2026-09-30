@@ -419,13 +419,20 @@ func (ix *InvertedIndex) Get(external string) (*Document, bool) {
 
 // Postings 返回 (field, term) 的 posting 列表副本。
 //
-// 返回副本而不是内部切片：调用方可以在锁外安全使用，
-// 代价是每次查询有一次与命中数成正比的拷贝开销。
-// 若 Phase 5 压测显示这是瓶颈，再改为在索引读锁内完成整个检索。
+// 返回副本而不是内部切片，调用方可以在锁外安全使用。
+// 但代价不小：每条记录都会深拷贝一次 Positions。实测 1 万条命中的词条
+// 要花 0.7ms / 400KB / 1 万次分配，一次 3 词查询就会击穿延迟预算。
+//
+// 检索热路径请改用 View + View.Scan——那是零拷贝的一致快照。
 func (ix *InvertedIndex) Postings(field, term string) []Posting {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
+	return ix.postingsLocked(field, term)
+}
+
+// postingsLocked 是 Postings 的实现，调用方必须持锁。
+func (ix *InvertedIndex) postingsLocked(field, term string) []Posting {
 	pl := ix.terms[TermKey(field, term)]
 	if pl == nil {
 		return nil
@@ -445,6 +452,11 @@ func (ix *InvertedIndex) DocFreq(field, term string) uint32 {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
+	return ix.docFreqLocked(field, term)
+}
+
+// docFreqLocked 是 DocFreq 的实现，调用方必须持锁。
+func (ix *InvertedIndex) docFreqLocked(field, term string) uint32 {
 	if pl := ix.terms[TermKey(field, term)]; pl != nil {
 		return pl.DF
 	}
@@ -472,6 +484,11 @@ func (ix *InvertedIndex) Fields() []string {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
+	return ix.fieldsLocked()
+}
+
+// fieldsLocked 是 Fields 的实现，调用方必须持锁。
+func (ix *InvertedIndex) fieldsLocked() []string {
 	out := make([]string, 0, len(ix.fieldSet))
 	for f := range ix.fieldSet {
 		out = append(out, f)
@@ -485,6 +502,11 @@ func (ix *InvertedIndex) FieldStats(field string) (FieldStats, bool) {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
+	return ix.fieldStatsLocked(field)
+}
+
+// fieldStatsLocked 是 FieldStats 的实现，调用方必须持锁。
+func (ix *InvertedIndex) fieldStatsLocked(field string) (FieldStats, bool) {
 	docs := ix.fieldDocs[field]
 	if docs == 0 {
 		return FieldStats{}, false
@@ -504,6 +526,11 @@ func (ix *InvertedIndex) DocLength(id DocID, field string) int {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
+	return ix.docLengthLocked(id, field)
+}
+
+// docLengthLocked 是 DocLength 的实现，调用方必须持锁。
+func (ix *InvertedIndex) docLengthLocked(id DocID, field string) int {
 	doc, ok := ix.docs[id]
 	if !ok {
 		return 0
