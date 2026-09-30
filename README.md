@@ -2,7 +2,7 @@
 
 用 Go 从零实现的全文搜索服务：**单二进制、零第三方依赖、内存倒排索引、HTTP JSON API**。
 
-> 当前进度：**Phase 0（骨架与工具链）**。
+> 当前进度：**Phase 1（文本分析器）已完成**，下一步 Phase 2（倒排索引内核）。
 > 完整的项目规划、选型理由与分阶段 TODO 见 [PLAN.md](PLAN.md)。
 
 ## 特性（目标）
@@ -87,7 +87,7 @@ make check
 cmd/tshd/          # 守护进程入口：配置装配、日志、优雅关闭
 internal/config/   # 配置解析（flag + env）
 internal/httpapi/  # HTTP 路由、中间件、DTO、错误映射
-internal/analyzer/ # 文本分析（Phase 1）
+internal/analyzer/ # 文本分析 ✅ StandardAnalyzer + 内置停用词表
 internal/index/    # 倒排索引（Phase 2）
 internal/query/    # 查询 AST 与解析（Phase 3）
 internal/scoring/  # BM25 与 Top-K（Phase 3）
@@ -95,3 +95,59 @@ pkg/tsh/           # 对外门面 Engine
 ```
 
 依赖方向单向向内：`httpapi → tsh → {analyzer, query, index, scoring}`。
+
+## 故障排查
+
+### `workspace-write` 沙箱初始化失败：`SetNamedSecurityInfoW failed (Win32 5)`
+
+**现象**：在 DSH 中以 `workspace-write` 模式执行任何命令，都在沙箱准备阶段报
+`grantWrite(<workspace>)` 失败，只有 `danger-full-access` 可用。
+
+**根因**：DSH 沙箱用 **write-restricted token** 运行命令。这类令牌会绕过 NTFS
+「对象所有者隐式拥有 `READ_CONTROL` + `WRITE_DAC`」的规则，强制所有写访问
+（含改 DACL）必须由 ACL **显式**授权。而工作区默认继承来的
+`Authenticated Users:(M)` 与 `Users:(RX)` 都不含 `WRITE_DAC`。
+
+**修复**（无需管理员——你是目录所有者）：
+
+```powershell
+icacls "D:\codes\golang\go_tsh" /grant "%USERNAME%:(OI)(CI)F"
+```
+
+等价写法：
+
+```powershell
+$me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = Get-Acl 'D:\codes\golang\go_tsh'
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+Set-Acl -Path 'D:\codes\golang\go_tsh' -AclObject $acl
+```
+
+**回滚**：`icacls "D:\codes\golang\go_tsh" /remove:g "%USERNAME%"`
+
+### `Get-Content` 读日志乱码
+
+Windows PowerShell 5.1 的 `Get-Content` 默认按 ANSI（简体中文下为 GBK）解码，
+读 Go 输出的 UTF-8 日志会显示成乱码（`服务启动` → `鏈嶅姟鍚姩`）。
+加 `-Encoding utf8` 即可，日志文件本身的字节是正确的。
+
+### `scripts/check.ps1` 报 `Unexpected token '}'`
+
+该脚本必须保持**纯 ASCII**。PS 5.1 会把无 BOM 的 UTF-8 `.ps1` 按 GBK 解析，
+中文注释被打碎后会直接破坏语法。若要写中文，必须存为 UTF-8 **带 BOM**。
+
+### `SKIP -race (needs cgo + a C compiler)`
+
+竞态检测依赖 cgo。本机 `CGO_ENABLED=0` 且没有 C 编译器，因此
+`check.ps1` 自动降级为普通 `go test` 并明确告警——**不会假装通过**。
+安装 mingw-w64 后设置 `CGO_ENABLED=1` 即可启用。
+
+### 沙箱内 `go` 警告模块缓存不可写
+
+```
+writing stat cache: open C:\Users\liuguobing\go\pkg\mod\cache\...: Access is denied
+```
+
+本项目零第三方依赖，构建与测试都不受影响。若将来引入依赖，
+把 `GOMODCACHE` 指向工作区内即可。

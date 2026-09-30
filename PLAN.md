@@ -295,7 +295,8 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 > - Shell 实为 **Windows PowerShell 5.1**（`PSEdition=Desktop`，并非 pwsh 7）：`Console.OutputEncoding=utf-8` 但 `InputEncoding=gb2312`，**`Get-Content` 默认按 ANSI/GBK 解码**，读 Go 程序输出的 UTF-8 日志会乱码（实测 `服务启动` 显示为 `鏈嶅姟鍚姩`），必须显式 `Get-Content -Encoding utf8`；日志文件本身的字节是正确的 UTF-8（`e6 9c 8d e5 8a a1 ...`）
 > - ⚠️ **`-race` 在本机不可用**：`CGO_ENABLED=0` 且宿主无任何 C 编译器（gcc / clang / tcc 均未找到，`GOENV` 文件不存在）。竞态检测依赖 cgo，没有它就完全跑不了
 > - **`.ps1` 脚本必须保持纯 ASCII**：PS 5.1 会把**无 BOM** 的 UTF-8 脚本按 GBK 解析，中文字符被打碎后直接破坏语法（实测 `scripts/check.ps1` 最初含中文注释时报 `Unexpected token '}'`）。本项目约定所有 `.ps1` 只用 ASCII；「保存为带 BOM 的 UTF-8」方案已否决，因为后续任何一次编辑都可能把 BOM 丢掉，属于隐形定时炸弹
-> - 沙箱：`workspace-write` 模式至今仍初始化失败，见下方遗留阻塞
+> - ✅ **沙箱问题已定位并修复**：根因是 DSH 沙箱使用的 write-restricted token 会绕过 NTFS「所有者隐式拥有 `WRITE_DAC`」规则，需要一条**显式** FullControl ACE。详见下方「遗留阻塞 1」
+> - 沙箱内 `go` 会警告模块缓存 `C:\Users\liuguobing\go\pkg\mod\cache` 不可写；本项目零依赖，构建与测试不受影响
 
 - [x] 确认 Go 工具链 → `D:\Program Files\Go\bin\go.exe`，`go1.27.1`
 - [x] 创建 `D:\codes\golang\go_tsh` 目录
@@ -310,20 +311,90 @@ GET /search?q=hello "world" -foo&limit=10&mode=and
 - [x] `.gitignore`、`.gitattributes`、`README.md`（含配置表与接口清单）
 - [x] `git init` + 首次提交
 - [x] **验收**：`go build ./...` / `go vet ./...` / `gofmt -l .` / `go test ./...` 全绿；二进制冒烟测试通过（`/healthz`→200、`/api/v1/stats`→200、未知路径→404、`POST /healthz`→405）
-- [ ] **遗留阻塞 1｜沙箱**：`pwsh` 在 `workspace-write` 下启动即报 `SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\codes\golang\go_tsh)`，仅 `danger-full-access` 可用。需以管理员授予当前用户对该目录的完全控制（`WRITE_DAC`）
+- [x] **遗留阻塞 1｜沙箱 —— 已修复**
+
+      **症状**：`workspace-write` 模式下每条命令都在沙箱初始化阶段失败，报
+      `SetNamedSecurityInfoW failed (Win32 5): grantWrite(D:\codes\golang\go_tsh)`，
+      只有 `danger-full-access` 可用。
+
+      **排查过程与结论**（`Get-Acl` / `icacls` / 一次 `Set-Acl` 对照实验）：
+      - `D:` 是 **NTFS**，不是 FAT/exFAT；目录也不是 junction 或同步盘 → ACL 机制本身可用
+      - DACL 中**没有任何 DENY 规则**
+      - 目录 Owner 就是当前用户，但 ACL 只给了 `Authenticated Users:(M)` 与 `Users:(RX)`，
+        两者**都不含 `WRITE_DAC`**
+      - 关键反证：非提权状态下 `Set-Acl` **能成功**改写 DACL —— 因为 Windows 对
+        对象所有者隐式授予 `READ_CONTROL` + `WRITE_DAC`
+      - ⇒ 结论：DSH 沙箱用 **write-restricted token**（`CreateRestrictedToken` 的
+        `WRITE_RESTRICTED`）运行命令，它绕过了所有者的隐式特权，强制写访问必须由
+        DACL **显式**授权，因此被拒
+
+      **修复**（无需管理员，因为你是目录所有者）：
+      ```powershell
+      icacls "D:\codes\golang\go_tsh" /grant "%USERNAME%:(OI)(CI)F"
+      ```
+      或等价的 PowerShell：
+      ```powershell
+      $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+      $acl = Get-Acl 'D:\codes\golang\go_tsh'
+      $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+          $me, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+      Set-Acl -Path 'D:\codes\golang\go_tsh' -AclObject $acl
+      ```
+
+      **验证**：修复后不带任何提权重跑 `pwsh` 成功；`go build` / `go vet` / `go test` /
+      `scripts/check.ps1` 全部在沙箱内通过。
+
+      **回滚**：`icacls "D:\codes\golang\go_tsh" /remove:g "%USERNAME%"`
+- [ ] **遗留观察｜沙箱内模块缓存不可写**：`go` 会打印
+      `writing stat cache: open C:\Users\liuguobing\go\pkg\mod\cache\...: Access is denied`。
+      本项目零依赖，构建与测试均不受影响（`GOCACHE` 仍可用，测试能命中缓存）。
+      若将来引入第三方依赖，需把 `GOMODCACHE` 指向工作区内，或放行该路径。
 - [ ] **遗留阻塞 2｜`-race` 不可用**：需安装 mingw-w64 并令 `CGO_ENABLED=1`，或把 `-race` 门禁下沉到 Linux CI。**在解决前，Phase 1 之后的并发安全只能靠人工审查，缺少工具兜底**
 - [ ] **遗留项｜PATH**：把 `D:\Program Files\Go\bin` 加入用户 PATH（当前靠脚本绝对路径兜底，不影响开发）
 - [ ] **遗留项｜换行符**：`git` 提示 LF→CRLF 转换，已加 `.gitattributes`，需 `git add --renormalize .` 落地
 
-### Phase 1 — 文本分析器
-- [ ] 定义 `Token{Term string; Position uint32}` 与 `Analyzer` 接口
-- [ ] `StandardAnalyzer`：rune 扫描按 `unicode.IsLetter/IsDigit` 切分（CJK/emoji/连字符/下划线正确处理）
-- [ ] 归一化：`unicode.ToLower`；可选 `strings.ToLower` 前置
-- [ ] 最小词长过滤（默认 2，数字除外）
-- [ ] 内嵌英文停用词表（`go:embed` + `stopwords.txt`，约 120 词）
-- [ ] 单测：大小写、标点、连续空白、空串、纯标点、混合 CJK、emoji、超长 token
-- [ ] 基准：`BenchmarkAnalyze`（1KB / 10KB 文本）
-- [ ] **验收**：`Hello, WORLD!` → `[hello, world]`；位置连续且与原文顺序一致
+### Phase 1 — 文本分析器 ✅ 已完成（commit 1761d7d + 5a8a064）
+
+> **与原计划的偏差**（都是有意的改进）：
+> - **CJK 逐字切分**：原计划只说「英文 + Unicode 规范化」。但若把一整段中文当成一个 token，
+>   检索会完全失效。改为 Han / Hiragana / Katakana **逐字**切分（unigram），
+>   至少保证单字可召回；真正的分词仍留给 Phase 6。
+>   韩文 Hangul 不在此列——现代韩文以空格分词，按普通词处理即可。
+> - **词内撇号保留**：`don't` 不再被拆成 `don` + `t`，弯引号 `’` 归一为直引号 `'`，
+>   否则停用词表里的缩略词永远匹配不上。
+> - **全角折叠**：`ＦＵＬＬ` → `full`。覆盖中文输入法下常见的全角字母/数字，
+>   成本只是 `r-rune(0xFF01)+0xFEE0` 的区间映射，无需引入 `x/text` 的 NFKC。
+> - **停用词表 177 条**（原计划约 120 条）。
+
+- [x] 定义 `Token{Term string; Position uint32}` 与 `Analyzer` 接口
+- [x] `StandardAnalyzer`：按 `unicode.IsLetter/IsDigit` 切分，其余字符为分隔符
+- [x] 归一化：`unicode.ToLower` + 全角折叠 + 弯引号归一
+- [x] 最小词长过滤（默认 2，**不作用于 CJK 单字**）
+- [x] 内嵌英文停用词表（`go:embed` + `stopwords.txt`，177 条，支持 `#` 注释与行尾注释）
+- [x] **位置语义**：被过滤的词条同样占用位置，保持词间距，
+      使 `quick the brown` 中 quick 与 brown 位置差为 2，短语 `quick brown` 不会误命中
+- [x] 单测：切分/大小写/标点/连续空白/空串/纯标点/全角/CJK/中英混合/撇号/数字/重复词，
+      另加位置单调性、停用词加载、6 组选项、纯函数性、并发一致性
+- [x] 基准：`BenchmarkAnalyzeEnglish` / `BenchmarkAnalyzeMixed` / `BenchmarkNewStandardWith`
+- [x] **验收**：`Hello, WORLD!` → `[hello@0, world@1]`；覆盖率 **97.8%**
+
+> **实测性能**（Intel Core Ultra 7 155H，1 KB 文本）
+> | 基准 | ns/op | 吞吐 | 分配 |
+> | --- | --- | --- | --- |
+> | `AnalyzeEnglish` | 43,277 | 29.5 MB/s | 201 allocs/op |
+> | `AnalyzeMixed` | 29,550 | 33.3 MB/s | 255 allocs/op |
+> | `NewStandardWith` | 71,348 | — | 373 allocs/op |
+>
+> 按 1 KB/doc 估算约 **29k docs/s**，满足「≥ 5000 docs/s」目标。
+> `NewStandardWith` 每次重建停用词表 map，**必须只构造一次并复用**——
+> 这正是指标里 `AllocsPerRun` 需要关注的地方。
+> 分配数偏高（`[]rune(text)` 转换 + 每个 token 一次 `string` 分配），
+> 若 Phase 5 压测显示索引是瓶颈，可考虑复用缓冲区。
+
+> **踩坑记录**：`TestAnalyze` 第一版全部走默认分析器，而 `out` 恰好在停用词表里，
+> 导致期望值写错、测试失败。根因是**切分测试与停用词过滤耦合**。
+> 现已改为 `tokenizer(KeepStopwords)` 与 `filtering(默认)` 两个分析器，
+> 用例显式声明是否启用停用词，把两件事彻底解耦。
 
 ### Phase 2 — 索引内核
 - [ ] 定义 `DocID` / `Document` / `Posting` / `PostingList`
