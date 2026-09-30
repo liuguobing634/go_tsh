@@ -132,6 +132,26 @@ go build -tags ne ...
 
 ---
 
+## 交付形态验证
+
+引入 gse 之后重新验证了交付形态，结论是**静态交付未受影响**：
+
+| 项 | 结果 |
+| --- | --- |
+| `CGO_ENABLED=0 GOOS=linux go build` | ✅ linux/amd64 38.47 MB、linux/arm64 37.94 MB |
+| 产物是静态 ELF（无 `ld-linux`） | ✅ |
+| `scratch` 镜像可运行 | ✅ **40.3 MB**，以 `nobody` 运行 |
+| 容器内中文检索 | ✅ `倒排索引` → 2 篇命中 |
+
+## 已知小问题
+
+**`LoadDict` 失败时会绕过 `SkipLog` 打一行日志。** gse 的 `LoadDict` 在
+文件路径分支里直接用 `log.Println` 输出，不受 `Segmenter.SkipLog` 控制。
+词典文件缺失时除了返回错误，stderr 上也会多一行 gse 的日志。
+不影响正确性，但在库场景下不够干净——错误已经通过返回值完整传出来了。
+
+---
+
 ## 踩坑记录
 
 这几条都是「先想当然、后被实测推翻」的，记下来避免重犯。

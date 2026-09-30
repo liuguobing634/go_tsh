@@ -1,6 +1,8 @@
 package tsh
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -230,6 +232,103 @@ func TestChineseEngineWithCustomDict(t *testing.T) {
 	if len(res.Hits) != 1 {
 		t.Fatalf("「倒排索引」应当命中，实际 %d 条", len(res.Hits))
 	}
+}
+
+// 中文显式短语查询：双引号要求位置连续。
+func TestChinesePhraseQuery(t *testing.T) {
+	// 独立引擎：这条测试要断言精确的命中集合，不能和别的测试共用索引。
+	e, err := NewWith(Options{Analyzer: AnalyzerChinese})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	docs := []Document{
+		{ID: "adjacent", Fields: map[string]string{"body": "全文搜索服务的核心"}},
+		{ID: "gapped", Fields: map[string]string{"body": "全文与搜索并不相邻"}},
+		{ID: "reordered", Fields: map[string]string{"body": "搜索全文的顺序反了"}},
+	}
+	for _, d := range docs {
+		if _, err := e.Upsert(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 非短语：默认操作符是 AND，两个词都在即可——三篇都同时含有
+	// 「全文」和「搜索」，因此全部命中。
+	res, err := e.Search(SearchRequest{Query: "全文 搜索", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("「全文 搜索」命中: %v", ids(res))
+	if res.Total != 3 {
+		t.Errorf("非短语查询应当命中全部 3 篇，实际 %d", res.Total)
+	}
+
+	// 短语：必须相邻且有序。只有 adjacent 满足，
+	// gapped（中间隔着「与」）与 reordered（顺序反了）都必须被排除。
+	res, err = e.Search(SearchRequest{Query: `"全文搜索"`, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ids(res)
+	t.Logf("「\"全文搜索\"」命中: %v", got)
+
+	if len(got) != 1 || got[0] != "adjacent" {
+		t.Errorf("短语查询应当只命中 adjacent，实际 %v", got)
+	}
+}
+
+// -dict 指定的**词典文件**必须真的生效。
+//
+// 内联词条（ChineseOptions.Dict）已有单测覆盖，但配置走的是文件路径，
+// 这条链路此前只被校验过、没有被功能验证过。
+func TestChineseEngineWithDictFile(t *testing.T) {
+	dir := t.TempDir()
+	dictPath := filepath.Join(dir, "words.txt")
+
+	// 同时覆盖注释行与 gse 的「词 词频 词性」格式
+	content := "# 领域词\n倒排索引 100 n\n跳表\nBM25排序 50\n"
+	if err := os.WriteFile(dictPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewWith(Options{Analyzer: AnalyzerChinese, DictPath: dictPath})
+	if err != nil {
+		t.Fatalf("加载词典文件失败: %v", err)
+	}
+
+	terms := map[string]bool{}
+	for _, tk := range e.Index().Analyzer().Analyze("倒排索引与跳表") {
+		terms[tk.Term] = true
+	}
+	t.Logf("加了词典文件后的分词: %v", terms)
+
+	if !terms["倒排索引"] {
+		t.Error("词典文件里的「倒排索引」没有生效，仍被切碎")
+	}
+	if !terms["跳表"] {
+		t.Error("词典文件里的「跳表」没有生效")
+	}
+}
+
+// 词典文件不存在时必须报错，而不是静默降级成只用内嵌词典。
+func TestChineseEngineMissingDictFileFails(t *testing.T) {
+	_, err := NewWith(Options{
+		Analyzer: AnalyzerChinese,
+		DictPath: filepath.Join(t.TempDir(), "missing.txt"),
+	})
+	if err == nil {
+		t.Fatal("词典文件不存在时应当报错")
+	}
+	t.Logf("报错信息: %v", err)
+}
+
+func ids(res SearchResult) []string {
+	out := make([]string, 0, len(res.Hits))
+	for _, h := range res.Hits {
+		out = append(out, h.ID)
+	}
+	return out
 }
 
 func TestUnknownAnalyzerKind(t *testing.T) {
