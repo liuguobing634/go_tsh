@@ -40,6 +40,14 @@ type Change struct {
 	// 回调可以读取与保留，但**不得修改**。
 	Fields map[string]string
 
+	// Kinds 是 Fields 里每个字段的类型。
+	//
+	// 持久化日志必须记录它：动态映射是「首次出现的类型即为该字段类型」，
+	// 若日志只存文本，重启重放时数字会退化成文本，映射结果就变了。
+	//
+	// 未出现在 map 里的字段按 FieldText 处理。
+	Kinds map[string]FieldKind
+
 	// Deleted 为 true 表示这是一次删除。
 	Deleted bool
 }
@@ -104,6 +112,17 @@ type InvertedIndex struct {
 	fieldTotalTokens map[string]uint64 // 每个字段的 token 总数
 	fieldDocs        map[string]uint32 // 含该字段的文档数
 
+	// schema 是字段名到类型的映射。
+	//
+	// 类型是**索引级**的，不是文档级的：同一字段在一份索引里只能有一种类型。
+	// 由 DeclareField 填充，冲突时报错而不是静默强转。
+	schema map[string]FieldKind
+
+	// numColumns 是数值/时间字段的列式存储，按字段名索引。
+	//
+	// 只在 schema 里声明为 number/date 的字段才有对应的列。
+	numColumns map[string]*numericColumn
+
 	// docFieldLens 按 DocID 稠密存放「某篇文档在某字段上有多少 token」。
 	//
 	// 为什么不复用 Document.FieldLen：那是 map，检索热路径上要对每条
@@ -153,6 +172,8 @@ func New(opts Options) *InvertedIndex {
 		fieldSet:         make(map[string]struct{}),
 		fieldTotalTokens: make(map[string]uint64),
 		fieldDocs:        make(map[string]uint32),
+		schema:           make(map[string]FieldKind),
+		numColumns:       make(map[string]*numericColumn),
 		docFieldLens:     make(map[string][]int32),
 		nextID:           1,
 	}
@@ -195,7 +216,38 @@ type preparedDoc struct {
 	fields   map[string]string
 	fieldLen map[string]int
 	analyzed []analyzedField
+	numeric  []numericField
 	total    int
+}
+
+// numericField 是一个待写入数值列的字段。
+type numericField struct {
+	field string
+	value float64
+}
+
+// snapshotKinds 取出给定字段集合的类型。
+//
+// 只在确实存在非文本字段时才分配 map：绝大多数写入都是纯文本，
+// 不该为此每次多一次分配。
+func (ix *InvertedIndex) snapshotKinds(fields map[string]string) map[string]FieldKind {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+
+	if len(ix.schema) == 0 {
+		return nil
+	}
+
+	var out map[string]FieldKind
+	for name := range fields {
+		if k, ok := ix.schema[name]; ok && k != FieldText {
+			if out == nil {
+				out = make(map[string]FieldKind, 4)
+			}
+			out[name] = k
+		}
+	}
+	return out
 }
 
 // prepare 校验参数并分析所有字段。它不接触索引状态，因此无需持锁。
@@ -226,21 +278,46 @@ func (ix *InvertedIndex) prepare(external string, fields map[string]string) (*pr
 	}
 	slices.Sort(names)
 
+	// 取一次 schema 快照。
+	//
+	// prepare 之所以在写锁**之外**，是为了让分词并行；所以这里绝不能
+	// 把锁持到分析结束，只能短暂地读一下字段类型立刻释放。
+	kinds := ix.snapshotKinds(fields)
+
 	for _, name := range names {
 		if strings.TrimSpace(name) == "" {
 			return nil, ErrEmptyFieldName
 		}
 
-		tokens := ix.analyzer.Analyze(fields[name])
-		p.fields[name] = fields[name]
-		p.fieldLen[name] = len(tokens)
-		p.total += len(tokens)
+		kind := FieldText
+		if k, ok := kinds[name]; ok {
+			kind = k
+		}
+
+		raw := fields[name]
+		p.fields[name] = raw
+
+		tokens, numeric := ix.fieldTokens(kind, raw)
+
+		if numeric {
+			// 数值与时间字段不进倒排索引，只写数值列。
+			//
+			// token 数记为 0 是刻意的：BM25 的长度归一化只该统计
+			// 参与评分的文本词条，把「价格 42」算进文档长度会污染打分。
+			v, err := parseFieldNumber(kind, raw)
+			if err != nil {
+				return nil, fmt.Errorf("字段 %q: %w", name, err)
+			}
+			p.numeric = append(p.numeric, numericField{field: name, value: v})
+		} else {
+			p.fieldLen[name] = len(tokens)
+			p.total += len(tokens)
+			p.analyzed = append(p.analyzed, analyzedField{field: name, tokens: tokens})
+		}
 
 		if p.total > ix.maxTokens {
 			return nil, fmt.Errorf("%w: 已超过 %d", ErrDocumentTooLarge, ix.maxTokens)
 		}
-
-		p.analyzed = append(p.analyzed, analyzedField{field: name, tokens: tokens})
 	}
 
 	return p, nil
@@ -261,7 +338,7 @@ func (ix *InvertedIndex) Add(external string, fields map[string]string) (DocID, 
 	}
 
 	id := ix.insertLocked(p)
-	if err := ix.notifyApply(Change{External: p.external, Fields: p.fields}); err != nil {
+	if err := ix.notifyApply(ix.changeFor(p)); err != nil {
 		return InvalidDocID, err
 	}
 	return id, nil
@@ -288,7 +365,7 @@ func (ix *InvertedIndex) Update(external string, fields map[string]string) (DocI
 	ix.removeLocked(old)
 
 	id := ix.insertLocked(p)
-	if err := ix.notifyApply(Change{External: p.external, Fields: p.fields}); err != nil {
+	if err := ix.notifyApply(ix.changeFor(p)); err != nil {
 		return InvalidDocID, err
 	}
 	return id, nil
@@ -311,7 +388,7 @@ func (ix *InvertedIndex) Upsert(external string, fields map[string]string) (id D
 	}
 
 	id = ix.insertLocked(p)
-	if err := ix.notifyApply(Change{External: p.external, Fields: p.fields}); err != nil {
+	if err := ix.notifyApply(ix.changeFor(p)); err != nil {
 		return InvalidDocID, false, err
 	}
 	return id, created, nil
@@ -344,6 +421,16 @@ func (ix *InvertedIndex) notifyApply(c Change) error {
 	return ix.onApply(c)
 }
 
+// changeFor 为一次写入构造变更通知，并带上各字段的类型。
+// 调用方必须持有写锁（要读 schema）。
+func (ix *InvertedIndex) changeFor(p *preparedDoc) Change {
+	return Change{
+		External: p.external,
+		Fields:   p.fields,
+		Kinds:    ix.fieldKindsOf(p.fields),
+	}
+}
+
 // insertLocked 把已分析好的文档写入索引。调用方必须持有写锁。
 func (ix *InvertedIndex) insertLocked(p *preparedDoc) DocID {
 	id := ix.nextID
@@ -367,8 +454,58 @@ func (ix *InvertedIndex) insertLocked(p *preparedDoc) DocID {
 	}
 
 	ix.totalTokens += uint64(p.total)
+
+	// 数值/时间字段写进列。它们不产生 posting，因此上面那个循环里没有它们。
+	for _, nf := range p.numeric {
+		col := ix.numColumns[nf.field]
+		if col == nil {
+			col = &numericColumn{}
+			ix.numColumns[nf.field] = col
+		}
+		col.set(id, nf.value)
+	}
+
 	ix.bytes += docBytes(ix.docs[id])
 	return id
+}
+
+// fieldTokens 按字段类型产出该字段的 token 流。
+//
+// numeric 为 true 表示这个字段不进倒排索引，而是写进数值列。
+//
+// ⚠️ 这个函数**必须被 prepare 与 removeLocked 共用**。
+// 删除时靠「重新分析原文」定位当初写入的 posting，只要两边对同一个字段
+// 产出的词条有任何差异，删除就会摘不干净——留下永远不会消失的幽灵命中，
+// 而症状是「删掉的文档还能搜到」，非常难查。
+//
+// 这类 bug 在只有文本字段时不会出现（两边都调 Analyze），
+// 一旦引入不分词的 keyword 字段就立刻成立。
+func (ix *InvertedIndex) fieldTokens(kind FieldKind, raw string) (tokens []analyzer.Token, numeric bool) {
+	switch {
+	case kind.Numeric():
+		return nil, true
+
+	case kind == FieldKeyword:
+		// 精确匹配字段：不做分词，整个值就是一个词条。
+		//
+		// **刻意不做停用词与最短长度过滤**：这两个规则是为文本检索设计的，
+		// 用在精确匹配上只会帮倒忙——把 keyword 值 "the" 或单字符标签
+		// 过滤掉，用户会以为是数据丢了。
+		term := strings.ToLower(strings.TrimSpace(raw))
+		if term == "" {
+			return nil, false
+		}
+		return []analyzer.Token{{
+			Term: term,
+			// 位置 0、区间覆盖整个值：这样高亮能标出完整字段值。
+			Position: 0,
+			Start:    0,
+			End:      len(raw),
+		}}, false
+
+	default:
+		return ix.analyzer.Analyze(raw), false
+	}
 }
 
 // setDocFieldLenLocked 写入「某文档在某字段上有多少 token」。
@@ -443,8 +580,19 @@ func (ix *InvertedIndex) insertFieldLocked(field string, id DocID, tokens []anal
 // 常驻一份 term key 列表：后者在 10 万文档量级要多吃数百 MB 常驻内存，
 // 而删除是低频操作，重算一遍分词的 CPU 成本远比常驻内存划算。
 func (ix *InvertedIndex) removeLocked(doc *Document) {
+	// 必须走 fieldTokens，与 prepare 保持完全一致：
+	// 否则不分词的 keyword 字段会摘不干净，留下幽灵命中。
 	for field, text := range doc.Fields {
-		for _, t := range ix.analyzer.Analyze(text) {
+		tokens, numeric := ix.fieldTokens(ix.schema[field], text)
+
+		if numeric {
+			if col := ix.numColumns[field]; col != nil {
+				col.clear(doc.ID)
+			}
+			continue
+		}
+
+		for _, t := range tokens {
 			key := TermKey(field, t.Term)
 			pl := ix.terms[key]
 			if pl == nil {

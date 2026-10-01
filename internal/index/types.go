@@ -126,4 +126,20 @@ var (
 	ErrNoFields         = errors.New("index: 文档至少需要一个字段")
 	ErrTooManyFields    = errors.New("index: 字段数超出上限")
 	ErrDocumentTooLarge = errors.New("index: 文档 token 数超出上限")
+
+	// ErrFieldKindConflict 表示同一字段被赋予了两种类型。
+	//
+	// 这是**必须报错**的情况而不是可以宽容处理的情况：
+	// 一个字段既是数字又是文本时，索引与查询都不知道该按哪套走，
+	// 静默选一个只会把问题推迟到更难追查的地方。
+	ErrFieldKindConflict = errors.New("index: 字段类型冲突")
+
+	// ErrInvalidFieldKind 表示类型名无法识别。
+	ErrInvalidFieldKind = errors.New("index: 非法的字段类型")
+
+	// ErrNotNumericField 表示对非数值字段做了数值/范围操作。
+	ErrNotNumericField = errors.New("index: 字段不是数值或时间类型")
+
+	// ErrInvalidFieldValue 表示字段值无法按声明类型解析。
+	ErrInvalidFieldValue = errors.New("index: 字段值无法按声明类型解析")
 )

@@ -1,6 +1,9 @@
 package index
 
-import "slices"
+import (
+	"fmt"
+	"slices"
+)
 
 // View 是一次一致性只读快照的访问入口。
 //
@@ -56,6 +59,48 @@ func (v *View) DocFreq(field, term string) uint32 {
 // DocLength 返回某文档某字段的 token 数。
 func (v *View) DocLength(id DocID, field string) int {
 	return v.ix.docLengthLocked(id, field)
+}
+
+// FieldKind 返回字段在快照中的类型；字段未声明时返回 false。
+func (v *View) FieldKind(field string) (FieldKind, bool) {
+	k, ok := v.ix.schema[field]
+	return k, ok
+}
+
+// NumericRange 把某数值/时间字段上落在区间内的 DocID 追加到 dst。
+//
+// 闭区间由 includeLo / includeHi 控制；单边范围传 math.Inf 即可。
+//
+// **返回的 DocID 天然升序**（按 DocID 顺序扫描列），
+// 因此可以直接当作求值器的命中列表使用，不需要排序或归并。
+//
+// 字段不存在或不是数值/时间类型时返回 ErrNotNumericField——
+// 这类错误必须显式报出来。静默返回空结果会让用户以为「没搜到」，
+// 而真正的原因是查询写错了字段类型。
+func (v *View) NumericRange(field string, lo, hi float64, includeLo, includeHi bool, dst []DocID) ([]DocID, error) {
+	kind, ok := v.ix.schema[field]
+	if !ok {
+		return dst, fmt.Errorf("%w: 字段 %q 未被声明为任何类型", ErrNotNumericField, field)
+	}
+	if !kind.Numeric() {
+		return dst, fmt.Errorf("%w: 字段 %q 是 %s 类型", ErrNotNumericField, field, kind)
+	}
+
+	col := v.ix.numColumns[field]
+	if col == nil {
+		// 声明了数值类型但还没有任何文档写入过这个字段。
+		return dst, nil
+	}
+	return col.rangeScan(lo, hi, includeLo, includeHi, dst), nil
+}
+
+// NumericValue 返回某文档在某数值字段上的值；无值或类型不符时返回 false。
+func (v *View) NumericValue(id DocID, field string) (float64, bool) {
+	col := v.ix.numColumns[field]
+	if col == nil || int(id) >= len(col.values) || !col.present[id] {
+		return 0, false
+	}
+	return col.values[id], true
 }
 
 // FieldLens 返回某字段按 DocID 下标的 token 数切片。
