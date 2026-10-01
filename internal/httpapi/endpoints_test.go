@@ -84,15 +84,15 @@ func seedDocs(t *testing.T, srv *Server) {
 	t.Helper()
 
 	docs := []documentRequest{
-		{ID: "doc-1", Fields: map[string]string{
+		{ID: "doc-1", Fields: map[string]any{
 			"title": "Inverted index",
 			"body":  "a searchable inverted index written in Go",
 		}},
-		{ID: "doc-2", Fields: map[string]string{
+		{ID: "doc-2", Fields: map[string]any{
 			"title": "Search engines",
 			"body":  "an engine relies on an inverted index",
 		}},
-		{ID: "doc-3", Fields: map[string]string{
+		{ID: "doc-3", Fields: map[string]any{
 			"title": "Baking bread",
 			"body":  "knead the dough then bake it",
 		}},
@@ -110,7 +110,7 @@ func TestCreateDocument(t *testing.T) {
 
 	rec := doJSON(t, srv, http.MethodPost, "/api/v1/documents", documentRequest{
 		ID:     "doc-1",
-		Fields: map[string]string{"title": "Hello World"},
+		Fields: map[string]any{"title": "Hello World"},
 	})
 	assertStatus(t, rec, http.StatusCreated)
 
@@ -134,7 +134,7 @@ func TestCreateDuplicateConflicts(t *testing.T) {
 
 	rec := doJSON(t, srv, http.MethodPost, "/api/v1/documents", documentRequest{
 		ID:     "doc-1",
-		Fields: map[string]string{"title": "Overwrite attempt"},
+		Fields: map[string]any{"title": "Overwrite attempt"},
 	})
 	assertStatus(t, rec, http.StatusConflict)
 
@@ -182,13 +182,13 @@ func TestPutDocumentCreatesThenOverwrites(t *testing.T) {
 
 	// 首次 PUT 是新建 → 201
 	rec := doJSON(t, srv, http.MethodPut, "/api/v1/documents/doc-1", documentRequest{
-		Fields: map[string]string{"body": "alpha beta"},
+		Fields: map[string]any{"body": "alpha beta"},
 	})
 	assertStatus(t, rec, http.StatusCreated)
 
 	// 再次 PUT 是覆盖 → 200
 	rec = doJSON(t, srv, http.MethodPut, "/api/v1/documents/doc-1", documentRequest{
-		Fields: map[string]string{"body": "gamma"},
+		Fields: map[string]any{"body": "gamma"},
 	})
 	assertStatus(t, rec, http.StatusOK)
 
@@ -206,7 +206,7 @@ func TestPutRejectsMismatchedID(t *testing.T) {
 
 	rec := doJSON(t, srv, http.MethodPut, "/api/v1/documents/path-id", documentRequest{
 		ID:     "body-id",
-		Fields: map[string]string{"body": "x"},
+		Fields: map[string]any{"body": "x"},
 	})
 	assertStatus(t, rec, http.StatusBadRequest)
 }
@@ -455,7 +455,7 @@ func TestFullLifecycle(t *testing.T) {
 	// 1. 写入
 	step("create", doJSON(t, srv, http.MethodPost, "/api/v1/documents", documentRequest{
 		ID: "article",
-		Fields: map[string]string{
+		Fields: map[string]any{
 			"title": "Full text search",
 			"body":  "an inverted index powers full text search",
 		},
@@ -477,7 +477,7 @@ func TestFullLifecycle(t *testing.T) {
 
 	// 4. 覆盖：旧词条消失
 	step("update", doJSON(t, srv, http.MethodPut, "/api/v1/documents/article", documentRequest{
-		Fields: map[string]string{"body": "completely different content now"},
+		Fields: map[string]any{"body": "completely different content now"},
 	}), http.StatusOK)
 
 	if got := search(t, srv, "/api/v1/search?q=inverted"); got.Total != 0 {
@@ -502,7 +502,7 @@ func TestFullLifecycle(t *testing.T) {
 	// 7. 同一个 ID 可以重新写入
 	step("recreate", doJSON(t, srv, http.MethodPost, "/api/v1/documents", documentRequest{
 		ID:     "article",
-		Fields: map[string]string{"body": "fresh content"},
+		Fields: map[string]any{"body": "fresh content"},
 	}), http.StatusCreated)
 }
 
@@ -520,7 +520,7 @@ func TestConcurrentHTTPTraffic(t *testing.T) {
 			defer func() { done <- struct{}{} }()
 			for i := 0; i < 30; i++ {
 				body := map[string]any{
-					"fields": map[string]string{"body": "concurrent traffic test"},
+					"fields": map[string]any{"body": "concurrent traffic test"},
 				}
 				raw, _ := json.Marshal(body)
 				target := "/api/v1/documents/w" + string(rune('0'+w)) + "-" + string(rune('0'+i%10))

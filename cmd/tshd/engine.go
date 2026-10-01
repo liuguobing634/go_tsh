@@ -18,10 +18,21 @@ func newEngine(cfg config.Config) (*tsh.Engine, error) {
 }
 
 func newEngineWithLogger(cfg config.Config, logger *slog.Logger) (*tsh.Engine, error) {
+	schema, err := config.ParseMapping(cfg.Mapping)
+	if err != nil {
+		return nil, err
+	}
+
+	kinds := make(map[string]tsh.FieldKind, len(schema))
+	for name, kind := range schema {
+		kinds[name] = tsh.FieldKind(kind)
+	}
+
 	return tsh.NewWith(tsh.Options{
 		Analyzer:   tsh.AnalyzerKind(cfg.Analyzer),
 		DictPath:   cfg.DictPath,
 		NoSubWords: cfg.NoSubWords,
+		Schema:     kinds,
 
 		DataDir:      cfg.DataDir,
 		SyncInterval: cfg.SyncInterval,

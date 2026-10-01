@@ -62,6 +62,58 @@ type Config struct {
 	// 写入返回后数据已经交给操作系统（进程崩溃不丢），
 	// 断电最多丢这个间隔内的写。调小更安全但更慢。
 	SyncInterval time.Duration
+
+	// Mapping 预先声明字段类型，格式为 "字段:类型,字段:类型"，
+	// 例如 "created:date,sku:keyword"。
+	//
+	// 数值与布尔可以从 JSON 原生类型直接推断，但**日期与关键字不行**：
+	// JSON 里没有日期类型，`"2024-01-15"` 只是一个字符串。
+	// 靠猜格式是错的——版本号 "2024-01-01" 会被当成日期，
+	// 而这是个很难被发现的静默错误。
+	Mapping string
+}
+
+// 支持的字段类型名，与 pkg/tsh 的 FieldKind 对应。
+var fieldKindNames = map[string]struct{}{
+	"text": {}, "keyword": {}, "number": {}, "date": {},
+}
+
+// ParseMapping 解析 "字段:类型,字段:类型" 形式的字段类型声明。
+//
+// 返回 nil 表示没有声明。
+func ParseMapping(spec string) (map[string]string, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, nil
+	}
+
+	out := make(map[string]string)
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+
+		name, kind, ok := strings.Cut(item, ":")
+		name, kind = strings.TrimSpace(name), strings.ToLower(strings.TrimSpace(kind))
+		if !ok || name == "" || kind == "" {
+			return nil, fmt.Errorf("mapping 项 %q 格式不对，应当写成 字段:类型", item)
+		}
+		if _, valid := fieldKindNames[kind]; !valid {
+			return nil, fmt.Errorf("mapping 项 %q 的类型 %q 无法识别，"+
+				"可选 text|keyword|number|date", item, kind)
+		}
+		if prev, dup := out[name]; dup {
+			return nil, fmt.Errorf("mapping 里字段 %q 被声明了两次（%s 与 %s）",
+				name, prev, kind)
+		}
+		out[name] = kind
+	}
+
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // Default 返回一套可直接用于本地开发的默认配置。
@@ -117,6 +169,7 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 	fs.BoolVar(&cfg.NoSubWords, "no-sub-words", cfg.NoSubWords, "关闭中文子词扩展")
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "持久化目录（留空则不持久化）")
 	fs.DurationVar(&cfg.SyncInterval, "sync-interval", cfg.SyncInterval, "批量 fsync 间隔")
+	fs.StringVar(&cfg.Mapping, "mapping", cfg.Mapping, `字段类型声明，如 "created:date,sku:keyword"`)
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, fmt.Errorf("解析命令行参数: %w", err)
@@ -213,6 +266,12 @@ func (c Config) Validate() error {
 	// 「用默认间隔」。同一个值在两处含义不同迟早出事，索性只留一种含义。
 	if c.SyncInterval <= 0 {
 		return fmt.Errorf("sync-interval 必须为正数，当前为 %s", c.SyncInterval)
+	}
+
+	// mapping 在启动时就校验：配错了应当立刻知道，
+	// 而不是等到第一次写入才报错。
+	if _, err := ParseMapping(c.Mapping); err != nil {
+		return err
 	}
 
 	positiveDurations := []struct {

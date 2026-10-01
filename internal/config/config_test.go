@@ -227,3 +227,79 @@ func TestPersistenceConfig(t *testing.T) {
 		}
 	})
 }
+
+func TestParseMapping(t *testing.T) {
+	t.Run("空表示不声明", func(t *testing.T) {
+		got, err := ParseMapping("   ")
+		if err != nil || got != nil {
+			t.Errorf("空输入应当返回 nil, nil，实际 %v, %v", got, err)
+		}
+	})
+
+	t.Run("正常解析", func(t *testing.T) {
+		got, err := ParseMapping(" created : DATE , sku:keyword ,price:number ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]string{"created": "date", "sku": "keyword", "price": "number"}
+		if len(got) != len(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("%s = %q, want %q", k, got[k], v)
+			}
+		}
+	})
+
+	t.Run("非法输入", func(t *testing.T) {
+		for _, bad := range []string{
+			"created",              // 缺少冒号
+			"created:",             // 缺少类型
+			":date",                // 缺少字段名
+			"created:martian",      // 未知类型
+			"a:date,b:date,c:date", // 合法
+		} {
+			_, err := ParseMapping(bad)
+			if bad == "a:date,b:date,c:date" {
+				if err != nil {
+					t.Errorf("%q 应当合法: %v", bad, err)
+				}
+				continue
+			}
+			if err == nil {
+				t.Errorf("%q 应当报错", bad)
+			}
+		}
+	})
+
+	t.Run("同一字段声明两次要报错", func(t *testing.T) {
+		if _, err := ParseMapping("a:date,a:keyword"); err == nil {
+			t.Error("重复声明应当报错")
+		}
+	})
+}
+
+func TestMappingConfig(t *testing.T) {
+	cfg, err := Load([]string{"-mapping", "created:date,sku:keyword"}, mapEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mapping != "created:date,sku:keyword" {
+		t.Errorf("mapping = %q", cfg.Mapping)
+	}
+
+	// 非法值必须在启动时就报错，而不是等到第一次写入
+	if _, err := Load([]string{"-mapping", "created:martian"}, mapEnv(nil)); err == nil {
+		t.Error("非法的 mapping 应当让启动失败")
+	}
+
+	// 环境变量同样可用
+	cfg, err = Load(nil, mapEnv(map[string]string{"TSH_MAPPING": "created:date"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mapping != "created:date" {
+		t.Errorf("从环境变量读到的 mapping = %q", cfg.Mapping)
+	}
+}

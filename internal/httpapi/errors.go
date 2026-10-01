@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuguobing/go_tsh/internal/index"
 	"github.com/liuguobing/go_tsh/internal/query"
+	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
 
 // 错误码与 HTTP 状态码解耦，便于调用方做程序化判断而非解析文案。
@@ -87,7 +88,19 @@ func (s *Server) writeMappedError(w http.ResponseWriter, err error) {
 		errors.Is(err, index.ErrEmptyFieldName),
 		errors.Is(err, index.ErrNoFields),
 		errors.Is(err, index.ErrTooManyFields),
-		errors.Is(err, index.ErrDocumentTooLarge):
+		errors.Is(err, index.ErrDocumentTooLarge),
+
+		// 字段类型相关的错误一律 400：它们全都是调用方能改的
+		// （换个字段名、改个值、或者用对类型的那张表）。
+		// 归到 500 会让调用方以为是服务端故障而无从下手。
+		errors.Is(err, index.ErrFieldKindConflict),
+		errors.Is(err, index.ErrInvalidFieldKind),
+		errors.Is(err, index.ErrInvalidFieldValue),
+		errors.Is(err, index.ErrNotNumericField),
+		errors.Is(err, tsh.ErrUnsupportedFieldType),
+		errors.Is(err, tsh.ErrAmbiguousField),
+		errors.Is(err, tsh.ErrIntegerTooLarge),
+		errors.Is(err, tsh.ErrNoFields):
 		writeError(w, http.StatusBadRequest, CodeBadRequest, err.Error())
 		return
 

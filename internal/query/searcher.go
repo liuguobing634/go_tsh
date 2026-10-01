@@ -89,10 +89,13 @@ func (s *Searcher) Search(n Node, opts SearchOptions) (Result, error) {
 		evalErr error
 	)
 	s.ix.View(func(v *index.View) {
+		// ⚠️ 这里**不能**因为 fields 为空就提前返回。
+		//
+		// resolveFields 返回的是「产生了 posting 的字段」，而数值/时间字段
+		// 根本不进倒排。一篇只有数值字段的文档会让 fields 为空——
+		// 一旦提前返回，范围查询会被整段跳过：既查不到东西，
+		// 也不会报「字段类型不对」，静默给出 0 结果。
 		fields := resolveFields(v, opts.Fields)
-		if len(fields) == 0 {
-			return
-		}
 		hits, evalErr = s.eval(v, n, fields)
 	})
 	if evalErr != nil {

@@ -51,6 +51,18 @@ type Options struct {
 	// 关闭后索引更小、写入更快，但只能整词匹配。
 	NoSubWords bool
 
+	// Schema 预先声明字段类型。
+	//
+	// 数值与布尔可以从 JSON 原生类型直接推断，但**日期与关键字不行**：
+	// JSON 里没有日期类型，`"2024-01-15"` 只是一个字符串。
+	// 想让它成为 date 字段（从而支持范围查询），只能在这里声明。
+	//
+	// 靠猜日期格式是错的：版本号 "2024-01-01" 会被当成日期，
+	// 而这是个很难被发现的静默错误。
+	//
+	// 未声明的字段按写入时的 JSON 类型动态确定。
+	Schema map[string]FieldKind
+
 	// Index 配置倒排索引（分析器、字段数与 token 数上限）。
 	Index index.Options
 
@@ -146,6 +158,15 @@ func NewWith(opts Options) (*Engine, error) {
 		return nil, err
 	}
 
+	// 预声明的类型必须在重放**之前**生效：重放的文档要按它来校验，
+	// 类型对不上时应当当场报错，而不是先按推断写入再被覆盖。
+	if err := declareSchema(e.idx, opts.Schema); err != nil {
+		if persist != nil {
+			_ = persist.log.Close()
+		}
+		return nil, err
+	}
+
 	// 重放必须在钩子生效的前提下进行——钩子内部会检查 replaying 标志，
 	// 因此重放期间不会把读到的记录又写回日志。
 	if persist != nil {
@@ -205,6 +226,20 @@ func newEngineWith(opts Options, persist *persistState) (*Engine, error) {
 
 		persist: persist,
 	}, nil
+}
+
+// declareSchema 把预声明的字段类型表装到索引上。
+func declareSchema(idx *index.InvertedIndex, schema map[string]FieldKind) error {
+	for name, kind := range schema {
+		ik, err := toIndexKind(kind)
+		if err != nil {
+			return fmt.Errorf("字段 %q: %w", name, err)
+		}
+		if err := idx.DeclareField(name, ik); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close 停止后台刷盘、做最后一次 fsync 并关闭持久化日志。可重复调用。

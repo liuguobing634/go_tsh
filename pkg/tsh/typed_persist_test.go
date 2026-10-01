@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/liuguobing/go_tsh/internal/index"
 	"github.com/liuguobing/go_tsh/internal/wal"
@@ -65,21 +66,24 @@ func TestFieldKindEncodingMatchesIndex(t *testing.T) {
 func TestTypedFieldsSurviveRestart(t *testing.T) {
 	dir := t.TempDir()
 
-	// 第一次：声明类型并写入
+	// 第一次：类型靠「放进哪张表」声明，不需要手动调 DeclareField
 	e := openPersistent(t, dir)
-	if err := e.idx.DeclareField("price", index.FieldNumber); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.idx.DeclareField("created", index.FieldDate); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.idx.DeclareField("sku", index.FieldKeyword); err != nil {
-		t.Fatal(err)
-	}
 
 	docs := []Document{
-		{ID: "d1", Fields: map[string]string{"title": "cheap", "price": "500", "created": "2024-01-15", "sku": "A-1"}},
-		{ID: "d2", Fields: map[string]string{"title": "pricey", "price": "2500", "created": "2024-08-15", "sku": "B-2"}},
+		{
+			ID:       "d1",
+			Fields:   map[string]string{"title": "cheap"},
+			Keywords: map[string]string{"sku": "A-1"},
+			Numbers:  map[string]float64{"price": 500},
+			Dates:    map[string]time.Time{"created": time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
+		},
+		{
+			ID:       "d2",
+			Fields:   map[string]string{"title": "pricey"},
+			Keywords: map[string]string{"sku": "B-2"},
+			Numbers:  map[string]float64{"price": 2500},
+			Dates:    map[string]time.Time{"created": time.Date(2024, 8, 15, 0, 0, 0, 0, time.UTC)},
+		},
 	}
 	for _, d := range docs {
 		if _, err := e.Upsert(d); err != nil {
