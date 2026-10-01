@@ -88,17 +88,6 @@ func ParseNumericValue(kind FieldKind, raw string) (float64, error) {
 	}
 }
 
-// formatFieldNumber 把数值列里的值还原成文本形式。
-//
-// 用 'g' + -1 精度：这是能**精确往返**（parse → format → parse 结果不变）
-// 的最短表示，因此回显与持久化都不会丢精度。
-func formatFieldNumber(kind FieldKind, v float64) string {
-	if kind == FieldDate {
-		return time.UnixMilli(int64(v)).UTC().Format(time.RFC3339)
-	}
-	return strconv.FormatFloat(v, 'g', -1, 64)
-}
-
 // maxExactInteger 是 float64 能精确表示的最大连续整数（2^53）。
 //
 // 超过它的整数放进数值列会静默丢精度——1 亿亿这个量级之前都没事，

@@ -2,7 +2,6 @@ package index
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 )
 
@@ -137,15 +136,5 @@ func (ix *InvertedIndex) fieldKindsOf(fields map[string]string) map[string]Field
 	for name := range fields {
 		out[name] = ix.schema[name] // 未声明的字段零值就是 FieldText
 	}
-	return out
-}
-
-// knownFields 返回 schema 里已声明的字段名（排序后），供错误信息与调试用。
-func (ix *InvertedIndex) knownFields() []string {
-	out := make([]string, 0, len(ix.schema))
-	for name := range ix.schema {
-		out = append(out, name)
-	}
-	slices.Sort(out)
 	return out
 }

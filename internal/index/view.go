@@ -94,15 +94,6 @@ func (v *View) NumericRange(field string, lo, hi float64, includeLo, includeHi b
 	return col.rangeScan(lo, hi, includeLo, includeHi, dst), nil
 }
 
-// NumericValue 返回某文档在某数值字段上的值；无值或类型不符时返回 false。
-func (v *View) NumericValue(id DocID, field string) (float64, bool) {
-	col := v.ix.numColumns[field]
-	if col == nil || int(id) >= len(col.values) || !col.present[id] {
-		return 0, false
-	}
-	return col.values[id], true
-}
-
 // FieldLens 返回某字段按 DocID 下标的 token 数切片。
 //
 // 返回的是内部切片的**别名**（零拷贝），只在 View 的 fn 执行期间有效。
