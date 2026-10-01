@@ -3,6 +3,8 @@ package query
 import (
 	"cmp"
 	"errors"
+	"fmt"
+	"math"
 	"slices"
 
 	"github.com/liuguobing/go_tsh/internal/analyzer"
@@ -82,14 +84,20 @@ func (s *Searcher) Search(n Node, opts SearchOptions) (Result, error) {
 	limit := clampLimit(opts.Limit)
 	offset := clampOffset(opts.Offset)
 
-	var hits hitList
+	var (
+		hits    hitList
+		evalErr error
+	)
 	s.ix.View(func(v *index.View) {
 		fields := resolveFields(v, opts.Fields)
 		if len(fields) == 0 {
 			return
 		}
-		hits = s.eval(v, n, fields)
+		hits, evalErr = s.eval(v, n, fields)
 	})
+	if evalErr != nil {
+		return Result{}, evalErr
+	}
 
 	total := hits.len()
 	if total == 0 {
@@ -138,6 +146,14 @@ func (s *Searcher) QueryTerms(n Node) []string {
 			collect(v.Text)
 		case *Phrase:
 			collect(v.Raw)
+		case *FieldTerm:
+			// 走文本侧的规则。**已知不足**：keyword 字段的词条是
+			// 「小写化的整值」，这里分析不出它，因此 keyword 字段
+			// 目前拿不到高亮。数值范围查询本来就没有可高亮的词条，
+			// 所以 FieldRange 直接跳过。
+			collect(v.Text)
+		case *FieldRange:
+			// 无词条可高亮
 		case *Bool:
 			for _, c := range v.Must {
 				walk(c)
@@ -364,17 +380,25 @@ func addExisting(dst *hitList, src hitList) {
 // ---------------------------------------------------------------- 求值
 
 // eval 求值一个节点。返回的 hitList 保证按 DocID 升序。
-func (s *Searcher) eval(v *index.View, n Node, fields []string) hitList {
+//
+// 返回错误是为了字段类子句：对文本字段做范围查询、数值字段上写了
+// 无法解析的值，这类问题**必须报出来**。静默返回空结果会让用户
+// 以为「没搜到」，而真正的原因是查询写错了——这是最难自查的一类失败。
+func (s *Searcher) eval(v *index.View, n Node, fields []string) (hitList, error) {
 	switch node := n.(type) {
 	case *Term:
-		return s.evalTerm(v, node, fields)
+		return s.evalTerm(v, node, fields), nil
 	case *Phrase:
-		return s.evalPhrase(v, node, fields)
+		return s.evalPhrase(v, node, fields), nil
+	case *FieldTerm:
+		return s.evalFieldTerm(v, node, fields)
+	case *FieldRange:
+		return s.evalFieldRange(v, node, fields)
 	case *Bool:
 		return s.evalBool(v, node, fields)
 	default:
-		// 解析器只会产出上面三种节点；走到这里说明有人手工构造了 AST。
-		return hitList{}
+		// 解析器只会产出上面几种节点；走到这里说明有人手工构造了 AST。
+		return hitList{}, nil
 	}
 }
 
@@ -593,17 +617,29 @@ func containsPosition(positions []uint32, want uint32) bool {
 }
 
 // evalBool 处理布尔组合。
-func (s *Searcher) evalBool(v *index.View, b *Bool, fields []string) hitList {
+func (s *Searcher) evalBool(v *index.View, b *Bool, fields []string) (hitList, error) {
 	var must, should, mustNot []hitList
 
 	for _, c := range b.Must {
-		must = append(must, s.eval(v, c, fields))
+		hl, err := s.eval(v, c, fields)
+		if err != nil {
+			return hitList{}, err
+		}
+		must = append(must, hl)
 	}
 	for _, c := range b.Should {
-		should = append(should, s.eval(v, c, fields))
+		hl, err := s.eval(v, c, fields)
+		if err != nil {
+			return hitList{}, err
+		}
+		should = append(should, hl)
 	}
 	for _, c := range b.MustNot {
-		mustNot = append(mustNot, s.eval(v, c, fields))
+		hl, err := s.eval(v, c, fields)
+		if err != nil {
+			return hitList{}, err
+		}
+		mustNot = append(mustNot, hl)
 	}
 
 	var out hitList
@@ -631,5 +667,114 @@ func (s *Searcher) evalBool(v *index.View, b *Bool, fields []string) hitList {
 		out = subtract(out, unionAll(mustNot))
 	}
 
-	return out
+	return out, nil
+}
+
+// evalFieldTerm 求值「字段:值」。
+//
+// 分流依据是**字段在索引里的类型**，不是查询的写法：
+//   - text / keyword → 当成该字段内的一个词条
+//   - number / date  → 等值，等价于 [v TO v]
+//
+// 字段没被声明过时按 text 处理：这是最常见的用法（查询先于写入到达，
+// 或拼错了字段名），报错反而会让人困惑。真正需要报错的是
+// 「字段声明成了 number，却给了非数值」——那种静默失败最难查。
+func (s *Searcher) evalFieldTerm(v *index.View, t *FieldTerm, fields []string) (hitList, error) {
+	kind, declared := v.FieldKind(t.Field)
+
+	if declared && kind.Numeric() {
+		value, err := index.ParseNumericValue(kind, t.Text)
+		if err != nil {
+			return hitList{}, fmt.Errorf("字段 %q: %w", t.Field, err)
+		}
+		return s.numericRange(v, t.Field, value, value, true, true)
+	}
+
+	// keyword 字段必须走 KeywordTerm，**不能**用分析器：
+	// 索引侧存的是「小写化的整值」，分析器切出来的词条跟它对不上，
+	// 结果就是「写得进去却查不出来」。
+	if declared && kind == index.FieldKeyword {
+		term := index.KeywordTerm(t.Text)
+		if term == "" {
+			return hitList{}, nil
+		}
+		return s.evalSingleTerm(v, term, []string{t.Field}), nil
+	}
+
+	// 文本字段（以及未声明的字段，按文本处理）：只在这一个字段里查词条。
+	//
+	// 这里**不接受 SearchOptions.Fields 的限制**：用户显式写了字段名，
+	// 就不该再被外面的字段过滤悄悄排除掉。
+	tokens := s.anz.Analyze(t.Text)
+	switch len(tokens) {
+	case 0:
+		return hitList{}, nil
+	case 1:
+		return s.evalSingleTerm(v, tokens[0].Term, []string{t.Field}), nil
+	default:
+		return s.evalPhraseTokens(v, tokens, []string{t.Field}), nil
+	}
+}
+
+// evalFieldRange 求值「字段:[下界 TO 上界]」。
+func (s *Searcher) evalFieldRange(v *index.View, r *FieldRange, fields []string) (hitList, error) {
+	kind, ok := v.FieldKind(r.Field)
+	if !ok {
+		return hitList{}, fmt.Errorf(
+			"%w: 字段 %q 未被声明过，无法做范围查询"+
+				"（范围查询只支持 number 与 date 类型）",
+			index.ErrNotNumericField, r.Field)
+	}
+	if !kind.Numeric() {
+		return hitList{}, fmt.Errorf(
+			"%w: 字段 %q 是 %s 类型，只能对 number/date 字段做范围查询",
+			index.ErrNotNumericField, r.Field, kind)
+	}
+
+	lo, hi := math.Inf(-1), math.Inf(1)
+
+	if r.Lower != "" {
+		v, err := index.ParseNumericValue(kind, r.Lower)
+		if err != nil {
+			return hitList{}, fmt.Errorf("字段 %q 的下界: %w", r.Field, err)
+		}
+		lo = v
+	}
+	if r.Upper != "" {
+		v, err := index.ParseNumericValue(kind, r.Upper)
+		if err != nil {
+			return hitList{}, fmt.Errorf("字段 %q 的上界: %w", r.Field, err)
+		}
+		hi = v
+	}
+
+	// 两端都为无界是不可能的：解析器已经拒绝 [* TO *]。
+	return s.numericRange(v, r.Field, lo, hi, r.IncludeLower, r.IncludeUpper)
+}
+
+// numericRange 扫描数值列产出命中列表。
+//
+// **得分一律为 0**：范围查询是纯过滤器。
+//
+// BM25 建立在词频与逆文档频率上，而「价格 42」没有词频概念，
+// 硬套只会得到一个没有意义的分数。于是：
+//   - 单独出现时按 DocID 排序；
+//   - 与文本子句 AND 时，分数只来自文本子句；
+//   - 与文本子句 OR 时，范围命中的文档也在结果里，只是分数低。
+//
+// 无需排序：列按 DocID 顺序扫描，输出天然升序，正是 hitList 的不变量。
+func (s *Searcher) numericRange(
+	v *index.View, field string,
+	lo, hi float64, includeLo, includeHi bool,
+) (hitList, error) {
+	ids, err := v.NumericRange(field, lo, hi, includeLo, includeHi, nil)
+	if err != nil {
+		return hitList{}, err
+	}
+
+	out := newHitList(len(ids))
+	for _, id := range ids {
+		out.add(id, 0)
+	}
+	return out, nil
 }

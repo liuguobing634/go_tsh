@@ -8,6 +8,16 @@ import (
 	"time"
 )
 
+// KeywordTerm 把 keyword 字段的值归一化成索引里的词条。
+//
+// ⚠️ 写入、删除、查询**三处都必须调它**。
+// keyword 字段的词条是「小写化的整值」，而分析器产出的是分词结果；
+// 只要有一处用了分析器的结果，就会出现「写得进去却查不出来」
+// 或者「删了还能搜到」这类极难排查的偏差。
+func KeywordTerm(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
 // ParseDate 把时间文本解析成 **UTC epoch 毫秒**。
 //
 // 支持两种格式：
@@ -36,12 +46,15 @@ func ParseDate(s string) (int64, error) {
 		ErrInvalidFieldValue, s)
 }
 
-// parseFieldNumber 把文本形式的值按声明类型解析成数值列里的 float64。
+// ParseNumericValue 把文本形式的值按声明类型解析成数值列里的 float64。
+//
+// 查询侧复用同一个实现：写入与查询若各有一套解析规则，
+// 迟早会出现「写得进去却查不出来」的偏差。
 //
 // 为什么不在这里直接收 float64：索引的写入 API 统一用 map[string]string，
 // 文本是唯一的线格式（持久化日志也存它）。类型信息来自 schema，
 // 解析在这里做一次，代价是 strconv.ParseFloat 的几十纳秒。
-func parseFieldNumber(kind FieldKind, raw string) (float64, error) {
+func ParseNumericValue(kind FieldKind, raw string) (float64, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
 		return 0, fmt.Errorf("%w: %s 字段 %q 的值为空",

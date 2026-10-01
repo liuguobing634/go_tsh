@@ -304,7 +304,7 @@ func (ix *InvertedIndex) prepare(external string, fields map[string]string) (*pr
 			//
 			// token 数记为 0 是刻意的：BM25 的长度归一化只该统计
 			// 参与评分的文本词条，把「价格 42」算进文档长度会污染打分。
-			v, err := parseFieldNumber(kind, raw)
+			v, err := ParseNumericValue(kind, raw)
 			if err != nil {
 				return nil, fmt.Errorf("字段 %q: %w", name, err)
 			}
@@ -491,7 +491,7 @@ func (ix *InvertedIndex) fieldTokens(kind FieldKind, raw string) (tokens []analy
 		// **刻意不做停用词与最短长度过滤**：这两个规则是为文本检索设计的，
 		// 用在精确匹配上只会帮倒忙——把 keyword 值 "the" 或单字符标签
 		// 过滤掉，用户会以为是数据丢了。
-		term := strings.ToLower(strings.TrimSpace(raw))
+		term := KeywordTerm(raw)
 		if term == "" {
 			return nil, false
 		}

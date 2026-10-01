@@ -52,6 +52,60 @@ type Phrase struct {
 func (p *Phrase) String() string { return `"` + p.Raw + `"` }
 func (*Phrase) isNode()          {}
 
+// FieldTerm 是字段限定的词条，语法为 field:value。
+//
+// 求值方式取决于字段类型：
+//   - text / keyword：在该字段内查这个词条
+//   - number / date：等值查询，等价于 field:[v TO v]
+//
+// Text 保持原始文本，由执行阶段按字段类型处理——与解析器不做分词
+// 是同一个道理：只有索引知道字段是什么类型、该用什么归一化规则。
+type FieldTerm struct {
+	Field string
+	Text  string
+}
+
+func (t *FieldTerm) String() string { return t.Field + ":" + t.Text }
+func (*FieldTerm) isNode()          {}
+
+// FieldRange 是字段限定的范围，语法为 field:[lo TO hi]。
+//
+// Lower / Upper 保持**原始文本**，由执行阶段按字段类型解析成数值。
+// 解析器不认识字段类型（类型在索引里），也不该认识——
+// 否则解析器与索引就得各自维护一套类型知识，迟早走偏。
+//
+// 空字符串表示该端无界（查询串里写作 *）。
+type FieldRange struct {
+	Field string
+	Lower string
+	Upper string
+
+	// IncludeLower / IncludeUpper 对应 [ ] 与 { } 四种组合。
+	IncludeLower bool
+	IncludeUpper bool
+}
+
+func (r *FieldRange) String() string {
+	lo, hi := r.Lower, r.Upper
+	if lo == "" {
+		lo = "*"
+	}
+	if hi == "" {
+		hi = "*"
+	}
+
+	left, right := "[", "]"
+	if !r.IncludeLower {
+		left = "{"
+	}
+	if !r.IncludeUpper {
+		right = "}"
+	}
+	return r.Field + ":" + left + lo + " TO " + hi + right
+}
+
+func (*FieldRange) isNode() {}
+
 // Bool 是布尔组合。
 //
 // 语义：

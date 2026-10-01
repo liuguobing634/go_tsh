@@ -95,12 +95,36 @@ const (
 	tokNot
 	tokLParen
 	tokRParen
+
+	// tokFieldTerm / tokFieldRange 是字段限定子句。
+	//
+	// 它们的语义在词法阶段就已经完全确定（信息量超过一个字符串），
+	// 因此直接把构造好的 AST 节点挂在 token 上，
+	// 而不是塞进 text 让语法阶段再拆一次。
+	tokFieldTerm
+	tokFieldRange
 )
 
 type token struct {
 	kind tokenKind
 	text string
 	pos  int // rune 下标
+
+	// node 只对 tokFieldTerm / tokFieldRange 有效。
+	node Node
+}
+
+// 字段名的合法字符：必须以字母或下划线开头。
+//
+// **不允许数字开头**是刻意的：查询里出现 `2024-01-01T10:00:00Z`
+// 这类时间戳时，若允许数字开头，`2024-01-01T10` 会被当成字段名，
+// 后面那个冒号就成了字段分隔符，整个时间戳被拆坏。
+func isFieldNameStart(r rune) bool {
+	return r == '_' || unicode.IsLetter(r)
+}
+
+func isFieldNameRune(r rune) bool {
+	return r == '_' || r == '.' || r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 func isQueryDelimiter(r rune) bool {
@@ -159,6 +183,42 @@ func scan(q string) ([]token, error) {
 			toks = append(toks, token{kind: tokPhrase, text: sb.String(), pos: start})
 
 		default:
+			// 先看是不是 field: 前缀。字段限定的范围语法可能跨空格
+			// （field:[10 TO 20]），所以必须在「扫整词」之前判断，
+			// 否则 `field:[10` 会先被当成一个词吃掉。
+			field, after, ok := scanFieldPrefix(runes, i)
+			if ok {
+				start := i
+				i = after
+
+				if i < len(runes) && (runes[i] == '[' || runes[i] == '{') {
+					node, next, err := scanFieldRange(q, runes, field, start, i)
+					if err != nil {
+						return nil, err
+					}
+					toks = append(toks, token{kind: tokFieldRange, pos: start, node: node})
+					i = next
+					continue
+				}
+
+				vs := i
+				for i < len(runes) && !isQueryDelimiter(runes[i]) {
+					i++
+				}
+				value := string(runes[vs:i])
+				if value == "" {
+					return nil, &SyntaxError{
+						Query: q, Pos: start,
+						Msg: fmt.Sprintf("字段 %q 后面缺少值", field),
+					}
+				}
+				toks = append(toks, token{
+					kind: tokFieldTerm, pos: start,
+					node: &FieldTerm{Field: field, Text: value},
+				})
+				continue
+			}
+
 			start := i
 			for i < len(runes) && !isQueryDelimiter(runes[i]) {
 				i++
@@ -180,6 +240,87 @@ func scan(q string) ([]token, error) {
 	}
 
 	return append(toks, token{kind: tokEOF, pos: len(runes)}), nil
+}
+
+// scanFieldPrefix 尝试从 i 处读出一个 "field:" 前缀。
+//
+// 返回字段名、冒号之后的位置、以及是否识别成功。
+func scanFieldPrefix(runes []rune, i int) (field string, after int, ok bool) {
+	if i >= len(runes) || !isFieldNameStart(runes[i]) {
+		return "", i, false
+	}
+
+	j := i
+	for j < len(runes) && isFieldNameRune(runes[j]) {
+		j++
+	}
+	if j >= len(runes) || runes[j] != ':' {
+		return "", i, false
+	}
+	return string(runes[i:j]), j + 1, true
+}
+
+// scanFieldRange 解析 field:[lo TO hi] 这类范围子句。
+//
+// 四种括号组合都允许（[ ]、{ }，以及 Lucene 也接受的混合写法 [a TO b}）。
+func scanFieldRange(q string, runes []rune, field string, start, open int) (Node, int, error) {
+	includeLower := runes[open] == '['
+
+	// 闭合括号找最近的一个，且允许与开启括号不同型。
+	j := open + 1
+	for j < len(runes) && runes[j] != ']' && runes[j] != '}' {
+		j++
+	}
+	if j >= len(runes) {
+		return nil, 0, &SyntaxError{
+			Query: q, Pos: start,
+			Msg: "范围缺少闭合的 ] 或 }",
+		}
+	}
+	includeUpper := runes[j] == ']'
+
+	content := strings.TrimSpace(string(runes[open+1 : j]))
+	lo, hi, err := splitRangeBounds(q, content, start)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return &FieldRange{
+		Field:        field,
+		Lower:        lo,
+		Upper:        hi,
+		IncludeLower: includeLower,
+		IncludeUpper: includeUpper,
+	}, j + 1, nil
+}
+
+// splitRangeBounds 把 "10 TO 20" 拆成两端；* 表示该端无界。
+func splitRangeBounds(q, content string, pos int) (lo, hi string, err error) {
+	// 用 Fields 而不是自己找 "TO"：这样 "TO" 必须是独立的一个词，
+	// 不会把值里恰好含有 TO 的部分切错（例如某个字段值叫 "TODO"）。
+	parts := strings.Fields(content)
+	if len(parts) != 3 || !strings.EqualFold(parts[1], "TO") {
+		return "", "", &SyntaxError{
+			Query: q, Pos: pos,
+			Msg: "范围要写成 字段:[下界 TO 上界]，例如 price:[10 TO 100]；" +
+				"无界的一端写 *",
+		}
+	}
+
+	lo, hi = parts[0], parts[2]
+	if lo == "*" {
+		lo = ""
+	}
+	if hi == "*" {
+		hi = ""
+	}
+	if lo == "" && hi == "" {
+		return "", "", &SyntaxError{
+			Query: q, Pos: pos,
+			Msg: "范围两端不能都是 *（那等于不设条件）",
+		}
+	}
+	return lo, hi, nil
 }
 
 // ---------------------------------------------------------------- 语法分析
@@ -264,7 +405,7 @@ func (p *parser) parseAnd() (Node, error) {
 // 然后被外层当成「多余的内容」报语法错误。
 func (p *parser) startsClause() bool {
 	switch p.peek().kind {
-	case tokWord, tokPhrase, tokLParen, tokNot, tokAnd:
+	case tokWord, tokPhrase, tokLParen, tokNot, tokAnd, tokFieldTerm, tokFieldRange:
 		return true
 	default:
 		return false
@@ -314,6 +455,14 @@ func (p *parser) parseAtom() (Node, error) {
 		}
 		return &Phrase{Raw: t.text}, nil
 
+	case tokFieldTerm, tokFieldRange:
+		// 语义在词法阶段就定好了，这里只做配额统计。
+		p.next()
+		if err := p.countClauses(t.pos, 1); err != nil {
+			return nil, err
+		}
+		return t.node, nil
+
 	case tokLParen:
 		p.next()
 		inner, err := p.parseOr()
@@ -330,7 +479,13 @@ func (p *parser) parseAtom() (Node, error) {
 		return nil, &SyntaxError{Query: p.query, Pos: t.pos, Msg: "表达式不完整"}
 
 	default:
-		return nil, &SyntaxError{Query: p.query, Pos: t.pos, Msg: fmt.Sprintf("意外的 %q", t.text)}
+		// 字段子句的 text 为空（信息在 node 上），用 String() 才能给出
+		// 有意义的报错。
+		what := t.text
+		if what == "" && t.node != nil {
+			what = t.node.String()
+		}
+		return nil, &SyntaxError{Query: p.query, Pos: t.pos, Msg: fmt.Sprintf("意外的 %q", what)}
 	}
 }
 

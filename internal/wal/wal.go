@@ -40,8 +40,18 @@ const (
 	// Magic 是文件头的魔数。
 	Magic = "TSHW"
 
-	// FormatVersion 是当前格式版本。格式不兼容时递增。
-	FormatVersion uint8 = 1
+	// FormatVersion 是当前写入的格式版本。
+	//
+	// v2 相对 v1 的变化：upsert 记录里每个字段多一个类型字节。
+	// 起因是索引引入了类型化字段（number / date），而动态映射要求
+	// 重启重放能复现同样的类型——只存文本是复现不出来的。
+	FormatVersion uint8 = 2
+
+	// legacyFormatVersion 是仍然可以**读**的旧版本。
+	//
+	// 兼容读取而不是拒绝启动：v1 的数据完全可解析（全部按 text 处理），
+	// 逼用户删数据重来是最差的处理方式。
+	legacyFormatVersion uint8 = 1
 
 	headerSize = 8
 
@@ -137,6 +147,10 @@ type Log struct {
 	interval time.Duration
 	maxRec   int
 
+	// version 是**这个文件**的格式版本，可能低于 FormatVersion（旧日志）。
+	// 构造后只读，不需要加锁。
+	version uint8
+
 	mu     sync.Mutex
 	buf    []byte // 复用编码缓冲，避免每次追加都分配
 	dirty  bool   // 自上次 fsync 以来是否有写入
@@ -224,10 +238,12 @@ func (l *Log) recover() error {
 		return fmt.Errorf("%w: 期望魔数 %q，实际 %q",
 			ErrFormatMismatch, Magic, string(header[:4]))
 	}
-	if header[4] != FormatVersion {
-		return fmt.Errorf("%w: 期望版本 %d，实际 %d（需要人工迁移或换用匹配的版本）",
-			ErrFormatMismatch, FormatVersion, header[4])
+	if header[4] != FormatVersion && header[4] != legacyFormatVersion {
+		return fmt.Errorf("%w: 期望版本 %d（也接受旧版 %d），实际 %d",
+			ErrFormatMismatch, FormatVersion, legacyFormatVersion, header[4])
 	}
+	// 记下这份日志的实际版本：解码方必须按它来，而不是按编译期常量。
+	l.version = header[4]
 
 	validEnd, badAt, err := l.scan(info.Size())
 	if err != nil {
@@ -483,3 +499,9 @@ func (l *Log) Size() int64 {
 
 // Path 返回日志的文件路径。
 func (l *Log) Path() string { return l.path }
+
+// Version 返回这份日志的**实际**格式版本。
+//
+// 它可能低于 FormatVersion（读到的是旧日志），因此解码方必须按它来，
+// 而不是按编译期的常量——否则旧日志会被按新布局解析，读出一堆乱码。
+func (l *Log) Version() uint8 { return l.version }

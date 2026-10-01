@@ -83,7 +83,10 @@ func (p *persistState) apply(c index.Change) error {
 		payload = wal.EncodeDelete(c.External, p.scratch[:0])
 	} else {
 		kind = wal.KindUpsert
-		payload = wal.EncodeUpsert(c.External, c.Fields, p.scratch[:0])
+		// 字段类型必须落盘，否则重启重放时 number/date 会退化成 text，
+		// 动态映射的结果就和重启前不一致了——症状是「重启后范围查询
+		// 报字段未声明」，很难联想到根因。
+		payload = wal.EncodeUpsert(c.External, c.Fields, kindBytes(c.Kinds), p.scratch[:0])
 	}
 	p.scratch = payload
 
@@ -92,6 +95,35 @@ func (p *persistState) apply(c index.Change) error {
 		// 让后续写直接失败，避免分歧继续扩大。
 		p.degrade(err)
 		return err
+	}
+	return nil
+}
+
+// kindBytes 把索引的字段类型转成日志里的编码。
+//
+// 这里做一次转换而不是让 wal 直接引用 index.FieldKind：
+// wal 是通用追加日志，不该知道「文档字段类型」这种业务概念。
+// 两边取值的对应关系由 TestFieldKindEncodingMatchesIndex 守着。
+func kindBytes(kinds map[string]index.FieldKind) map[string]uint8 {
+	if len(kinds) == 0 {
+		return nil
+	}
+
+	out := make(map[string]uint8, len(kinds))
+	for name, k := range kinds {
+		out[name] = uint8(k)
+	}
+	return out
+}
+
+// declareKinds 按日志里记录的类型声明字段。
+//
+// 未列出的字段是 text（默认值，日志里不逐个记录）。
+func declareKinds(idx *index.InvertedIndex, kinds map[string]uint8) error {
+	for name, raw := range kinds {
+		if err := idx.DeclareField(name, index.FieldKind(raw)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -120,14 +152,25 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 
 		switch k {
 		case wal.KindUpsert:
-			external, fields, err := wal.DecodeUpsert(payload)
+			// 版本从**日志本身**取，不用编译期常量：读到旧日志时布局不同，
+			// 按新布局解析会读出一堆乱码。
+			doc, err := wal.DecodeUpsert(p.log.Version(), payload)
 			if err != nil {
 				return fmt.Errorf("第 %d 条记录（upsert）解析失败: %w", recordNo, err)
 			}
-			if _, _, err := idx.Upsert(external, fields); err != nil {
+
+			// 先把类型声明回去，再写文档。
+			// 动态映射就靠这一步复现：重放顺序与当初的写入顺序一致，
+			// 因此推出的类型表也一致。
+			if err := declareKinds(idx, doc.Kinds); err != nil {
+				return fmt.Errorf("第 %d 条记录重放文档 %q 的字段类型失败: %w",
+					recordNo, doc.External, err)
+			}
+
+			if _, _, err := idx.Upsert(doc.External, doc.Fields); err != nil {
 				return fmt.Errorf("第 %d 条记录重放文档 %q 失败: %w"+
 					"（若是配置上限收紧所致，请调回原来的值或先清理该文档）",
-					recordNo, external, err)
+					recordNo, doc.External, err)
 			}
 			upserts++
 
