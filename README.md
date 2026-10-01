@@ -179,6 +179,7 @@ curl.exe --noproxy "*" "http://127.0.0.1:8080/api/v1/search?q=%E5%80%92%E6%8E%92
 price:[10 TO 100]                闭区间
 price:{10 TO 100}                开区间
 price:[10 TO *]                  单边（* 表示无界）
+price:>=10                       比较运算符（等价于 [10 TO *]）
 price:4999                       数值等值
 created:[2024-01-01 TO 2024-12-31]
 sku:LAP-1                        关键字精确匹配

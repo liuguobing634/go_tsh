@@ -349,6 +349,89 @@ func TestFieldTermIgnoresGlobalFieldFilter(t *testing.T) {
 	}
 }
 
+// 比较运算符写法：field:>=10 等价于区间，且**只在 field: 之后生效**。
+func TestComparisonOperatorSyntax(t *testing.T) {
+	cases := []struct {
+		query string
+		want  string // FieldRange 的 String()，会自动渲染成等价的区间形式
+	}{
+		{"price:>=10", "price:[10 TO *]"},
+		{"price:>10", "price:{10 TO *]"},
+		{"price:<=100", "price:[* TO 100]"},
+		{"price:<100", "price:[* TO 100}"},
+		{"created:>=2024-01-01", "created:[2024-01-01 TO *]"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			n := mustParse(t, tc.query, Options{})
+
+			r, ok := n.(*FieldRange)
+			if !ok {
+				t.Fatalf("应当解析成 FieldRange，实际 %T", n)
+			}
+			if got := r.String(); got != tc.want {
+				t.Errorf("Parse(%q) = %s, want %s", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestComparisonOperatorErrors(t *testing.T) {
+	for _, q := range []string{"price:>=", "price:<", "price:>"} {
+		if _, err := Parse(q, Options{}); err == nil {
+			t.Errorf("Parse(%q) 应当报错（运算符后没有值）", q)
+		} else {
+			t.Logf("%q -> %v", q, err)
+		}
+	}
+}
+
+// ⚠️ 兼容性守卫：`>` `<` **只在 field: 之后**被当作运算符。
+//
+// 若为了支持 field:>=10 就把它们变成全局词法分隔符，
+// `a>b` 这类与字段语法毫无关系的查询会被拆坏。
+func TestComparisonCharsStayLiteralOutsideFieldSyntax(t *testing.T) {
+	for _, q := range []string{"a>b", "x<y", "1>2>3"} {
+		t.Run(q, func(t *testing.T) {
+			n := mustParse(t, q, Options{})
+
+			if _, ok := n.(*Term); !ok {
+				t.Fatalf("%q 应当仍是一个普通词条，实际 %T（%s）", q, n, n.String())
+			}
+		})
+	}
+}
+
+func TestComparisonOperatorEvaluation(t *testing.T) {
+	s, _ := typedIndex(t)
+
+	// 价格：d1=500 d2=1500 d3=3000 d4=50
+	cases := []struct {
+		query string
+		want  []string
+	}{
+		{"price:>=1500", []string{"d2", "d3"}},
+		{"price:>1500", []string{"d3"}},
+		{"price:<=500", []string{"d1", "d4"}},
+		{"price:<500", []string{"d4"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			got := searchIDs(t, s, tc.query)
+			if len(got) != len(tc.want) {
+				t.Fatalf("命中 %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("命中 %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestFieldRangeClauseCounting(t *testing.T) {
 	// 范围子句也要计入配额，否则一个查询串就能绕过上限
 	_, err := Parse("price:[1 TO 2] price:[3 TO 4] price:[5 TO 6]", Options{MaxClauses: 2})

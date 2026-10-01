@@ -95,12 +95,19 @@ func (r *FieldRange) String() string {
 	}
 
 	left, right := "[", "]"
-	if !r.IncludeLower {
+
+	// 无界的那一侧，括号开闭没有意义，按自然方向渲染即可。
+	//
+	// 少了这两个 `!= ""` 判断，`field:>=10`（上界无界、IncludeUpper 是零值
+	// false）会被渲染成 `[10 TO *}`——语义没错，但看起来像写错了，
+	// 而它会出现在错误信息与日志里。
+	if r.Lower != "" && !r.IncludeLower {
 		left = "{"
 	}
-	if !r.IncludeUpper {
+	if r.Upper != "" && !r.IncludeUpper {
 		right = "}"
 	}
+
 	return r.Field + ":" + left + lo + " TO " + hi + right
 }
 

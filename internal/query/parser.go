@@ -201,6 +201,24 @@ func scan(q string) ([]token, error) {
 					continue
 				}
 
+				// 比较运算符写法：field:>=10。
+				// `>` `<` 只在这里被当作运算符，别处仍是普通字符。
+				if op, operand, next, ok := scanComparison(runes, i); ok {
+					if operand == "" {
+						return nil, &SyntaxError{
+							Query: q, Pos: start,
+							Msg: fmt.Sprintf("字段 %q 的比较运算符 %s 后面缺少值",
+								field, op),
+						}
+					}
+					toks = append(toks, token{
+						kind: tokFieldRange, pos: start,
+						node: comparisonRange(field, op, operand),
+					})
+					i = next
+					continue
+				}
+
 				vs := i
 				for i < len(runes) && !isQueryDelimiter(runes[i]) {
 					i++
@@ -321,6 +339,46 @@ func splitRangeBounds(q, content string, pos int) (lo, hi string, err error) {
 		}
 	}
 	return lo, hi, nil
+}
+
+// scanComparison 尝试从 i 处读出一个比较运算符及其操作数。
+//
+// 只在 field: 之后调用，因此 `>` `<` 在别处仍是普通字符——
+// 这一点很重要：把 `>` `<` 变成全局分隔符会破坏 `a>b` 这类既有查询，
+// 而那与字段语法毫无关系。
+func scanComparison(runes []rune, i int) (op, operand string, next int, ok bool) {
+	if i >= len(runes) || (runes[i] != '>' && runes[i] != '<') {
+		return "", "", i, false
+	}
+
+	j := i + 1
+	if j < len(runes) && runes[j] == '=' {
+		j++
+	}
+	operatorEnd := j
+
+	vs := j
+	for j < len(runes) && !isQueryDelimiter(runes[j]) {
+		j++
+	}
+	return string(runes[i:operatorEnd]), string(runes[vs:j]), j, true
+}
+
+// comparisonRange 把 field:>=10 这类写法折成等价的区间。
+//
+// 复用 FieldRange 而不是新加节点：语义完全一样，
+// 执行阶段也就只需要一条求值路径。
+func comparisonRange(field, op, operand string) *FieldRange {
+	switch op {
+	case ">=":
+		return &FieldRange{Field: field, Lower: operand, IncludeLower: true}
+	case ">":
+		return &FieldRange{Field: field, Lower: operand}
+	case "<=":
+		return &FieldRange{Field: field, Upper: operand, IncludeUpper: true}
+	default: // "<"
+		return &FieldRange{Field: field, Upper: operand}
+	}
 }
 
 // ---------------------------------------------------------------- 语法分析
