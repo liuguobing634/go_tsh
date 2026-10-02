@@ -1343,6 +1343,260 @@ curl "http://127.0.0.1:8080/api/v1/search?q=sku:LAP-1"
 
 ---
 
+### Phase 11 — 表（多命名空间） 📋 待实施（本阶段只有方案）
+
+> 需求：像数据库的表那样把不同内容分开——商品只查商品，资讯只查资讯。
+
+#### 11.1 先说结论：表**必须**是独立的索引实例
+
+直觉上「表」可以做成索引内的一个分区字段：给每篇文档打上 `_table` 标签，
+查询时自动 `AND _table:xxx`。实现最省事，但**这里行不通**，原因是
+上一轮刚建立的那条约束：
+
+> **schema 是索引级的。** `DeclareField("price", FieldNumber)` 之后，
+> 同一个索引里 `price` 就不能再是别的类型。
+
+于是「商品表的 price 是数字、资讯表的 price 是字符串编号」这种再正常不过的
+情况会直接撞上 `ErrFieldKindConflict`。
+
+要做成分区，就得给**每一个**数据结构都加一层表维度——`terms`、`byExternal`、
+`docs`、`fieldSet`、`docFieldLens`、`schema`、`numColumns` 全都要改，
+而换来的只是省一点内存。
+
+所以选**独立索引实例**：一个表 = 一套完整的索引 + searcher + 高亮 + 持久化日志。
+它顺带带来三个实际好处：
+
+| 好处 | 说明 |
+| --- | --- |
+| 每表独立 schema | 字段类型互不干扰，这正是**做不到分区**的那条 |
+| 查询只扫自己的表 | 查商品不会去扫资讯的 posting——这是真实的性能收益，不只是组织方式 |
+| 删表 = 丢索引 | 不需要遍历摘除，也不会留下空洞 |
+
+#### 11.2 表是什么：API 形状
+
+现在 `Engine` 里装的东西（`idx` / `search` / `hl` / `persist`）正好就是一张表的
+全部内容。所以实现基本是**把 Engine 现有的字段搬进 Table**：
+
+```go
+type Engine struct {
+    mu     sync.RWMutex
+    tables map[string]*Table
+    opts   Options        // 新表的默认配置
+}
+
+type Table struct {
+    name    string
+    idx     *index.InvertedIndex
+    search  *query.Searcher
+    hl      *highlight.Highlighter
+    popts   query.Options
+    persist *persistState
+}
+```
+
+对外接口：
+
+```go
+e, _ := tsh.NewWith(opts)
+
+t, err := e.Table("products")     // 取句柄，不存在则返回 ErrTableNotFound
+t.Upsert(doc)                     // 现有方法原样搬过来
+t.Search(req)
+
+e.Tables()                        // 列出所有表
+e.CreateTable("products", schema) // 显式建表
+e.DropTable("products")           // 删表
+```
+
+**Engine 上保留一组同名方法，作用在默认表上**（名字 `default`）。
+这样现有调用点、现有 HTTP 路由、现有 `data/` 目录**全部不用改**，
+是一次平滑扩展而不是破坏性重构。
+
+#### 11.3 持久化布局与迁移
+
+```
+data/
+  tables/
+    default.wal        # 默认表
+    products.wal
+    articles.wal
+```
+
+每个表一个独立的 WAL：故障隔离（一个表损坏不至于所有表都搜不出来），
+删表就是删文件。
+
+**迁移**：现有的 `data/documents.wal` 在启动时若发现
+`data/tables/default.wal` 不存在，就**改名过去**并记一条日志。
+一次性动作，之后布局统一。
+
+> 用改名而不是「继续读老路径」：两条路径并存意味着两套代码分支，
+> 而这是一次性的迁移，做完就干净了。目标文件不存在，`os.Rename`
+> 在 Windows 上也不涉及覆盖语义（那条 Phase 8 里标注过未验证的路径）。
+
+#### 11.4 表名的合法性（有文件系统陷阱）
+
+表名会直接拼进文件路径，因此**必须严格校验**，否则 `Table("../../etc/passwd")`
+就能逃出数据目录。
+
+规则：**只允许小写字母、数字、下划线、连字符，长度 1–64。**
+
+**不允许大写**不是洁癖，是因为**文件系统大小写不敏感**：
+在 Windows 与 macOS 上，`Products.wal` 与 `products.wal` 是**同一个文件**。
+允许大写就意味着两个不同的表会共用一份日志，数据互相污染——
+而这个问题在 Linux 上测不出来，上线才炸。
+
+拒绝大写的报错里要附上建议的小写形式（`products`），别让用户自己猜。
+
+#### 11.5 表级 schema 放哪里
+
+现在 `-mapping` 是全局的。有了表之后，它只能对默认表生效，需要新机制。
+
+| 方案 | 说明 | 评价 |
+| --- | --- | --- |
+| **A. 建表 API 带 schema** | `PUT /api/v1/tables/products` + body `{"schema":{"price":"number"}}` | **推荐**，与数据库心智一致 |
+| B. 配置文件 | `-mapping-file m.json`，按表分节 | 适合批量初始化，但没有 API 表达不了动态建表 |
+| C. 纯动态推断 | 全部靠首次写入推断 | 日期与关键字推断不出来（见 Phase 10） |
+
+**推荐 A + B 并存**：API 管运行时，配置文件管启动初始化。
+
+**关键实现问题：schema 怎么跨重启存活？**
+
+`DeclareField` 的状态现在只在内存里，靠 WAL 里的文档记录重建。但**一张刚建好、
+还没写入任何文档的表，重启后 schema 会丢**——而「先建表、声明好字段类型、
+再慢慢灌数据」恰恰是最常见的用法。
+
+解决办法：**给 WAL 加一种「声明字段」的记录类型**。
+
+比另写一个 `meta.json` 好在两点：
+1. 复用现成的原子性、CRC 校验与顺序保证；
+2. **不必引入 `os.Rename` 的覆盖语义**——那条正是 Phase 8 里标注为
+   「Windows 上未验证」的风险点，能绕开就绕开。
+
+记录类型是 `uint8`，新增一种（3 = declare）不改变既有记录的布局。
+但读取方认不出新类型会当成损坏数据，所以**文件头版本要升到 3**，
+让旧二进制干净地拒绝启动而不是报「日志损坏」。v1/v2 仍然可读。
+
+#### 11.6 HTTP 路由
+
+```
+GET    /api/v1/tables                      列出所有表（含文档数）
+PUT    /api/v1/tables/{table}              建表（幂等，body 可带 schema）
+GET    /api/v1/tables/{table}              表详情（schema + stats）
+DELETE /api/v1/tables/{table}              删表
+
+POST   /api/v1/tables/{table}/documents
+PUT    /api/v1/tables/{table}/documents/{id}
+GET    /api/v1/tables/{table}/documents/{id}
+DELETE /api/v1/tables/{table}/documents/{id}
+GET    /api/v1/tables/{table}/search
+```
+
+现有扁平路由**保持不变**，等价于默认表（在文档里标注为旧写法）。
+
+`GET /api/v1/stats` 改为全局视图 + 每表明细；表级 stats 在
+`/api/v1/tables/{table}` 里。
+
+#### 11.7 待验证的前提
+
+- [ ] `os.Rename` 在「目标不存在」时于 Windows 上的行为（迁移用，比覆盖语义弱，
+      但仍需实测）
+- [ ] 每个表的固定开销有多大（map、切片、WAL 句柄、缓冲区）？
+      决定「表数量上限」该定多少
+- [ ] 表名大小写不敏感的文件系统上，现有校验能否真的挡住
+      （写一个 `Products` 文件名，看 Windows 上是否与 `products` 撞车）
+- [ ] 几十个空表时的内存占用与启动耗时
+
+#### 11.8 待办清单
+
+**11.8.1 表与引擎重构（P0）**
+
+- [ ] 抽出 `Table` 结构，把 Engine 现有的 `idx/search/hl/persist` 搬进去
+- [ ] `Engine.tables map[string]*Table` + RWMutex
+- [ ] `Engine.Table(name)` / `Tables()` / `CreateTable()` / `DropTable()`
+- [ ] Engine 上的现有方法改为操作默认表（`default`），**保持签名不变**
+- [ ] 表数量上限（初值 64），超限返回明确错误
+
+**11.8.2 表名校验（P0）**
+
+- [ ] 只允许 `[a-z0-9_-]`，长度 1–64
+- [ ] 拒绝大写并给出建议的小写形式
+- [ ] 拒绝 `.` `..` `/` `\` 与空串
+- [ ] 校验函数单测：路径穿越、大小写、超长、空串、特殊字符
+
+**11.8.3 持久化（P0）**
+
+- [ ] 每表一个 `<dataDir>/tables/<name>.wal`
+- [ ] 启动时扫描 `tables/` 得到表列表
+- [ ] 目录里出现「有本程序 magic 但表名非法」的文件 → **拒绝启动**
+      （那是我们的数据，名字被改过，不能静默忽略）
+- [ ] 没有 magic 的文件 → 跳过并明确告警（不是我们的文件）
+- [ ] 旧路径 `data/documents.wal` → 迁移为 `tables/default.wal`
+- [ ] `Engine.Close` 关闭**所有**表的日志，逐个报错不中断
+
+**11.8.4 表级 schema（P0）**
+
+- [ ] WAL 新增 `KindDeclare` 记录类型；文件头版本升到 3，v1/v2 仍可读
+- [ ] 建表时把 schema 写进日志，重启时按顺序重放
+- [ ] `-mapping` 只作用于默认表；新增 `-mapping-file` 支持按表声明
+
+**11.8.5 HTTP（P0）**
+
+- [ ] 表管理四个端点
+- [ ] 表级文档与检索端点
+- [ ] 现有扁平路由保持不变（默认表）
+- [ ] 表不存在 → 404；表名非法 → 400；删表确认语义
+- [ ] `/api/v1/stats` 改为全局 + 每表明细
+
+**11.8.6 CLI（P1）**
+
+- [ ] `-mapping-file` 按表声明 schema
+- [ ] `-import-table` 指定 `-import` / `-generate` 的目标表（默认 default）
+
+**11.8.7 测试**
+
+- [ ] **表间完全隔离**：两个表用同名但不同类型的字段（`price` 一个是
+      number 一个是 keyword），都能正常写入与查询 ← 这是选型的立足点
+- [ ] 表间数据不串：A 表搜不到 B 表的文档
+- [ ] 表名非法（含路径穿越）全部被拒
+- [ ] 建表 / 删表 / 重复建表 / 删不存在的表
+- [ ] 每表独立持久化：重启后表列表、各表 schema、各表数据都正确
+- [ ] 空表（声明了 schema 但没文档）重启后 schema 仍在 ← WAL v3 的意义
+- [ ] 旧布局迁移：`documents.wal` → `tables/default.wal`
+- [ ] 关掉一个表不影响其它表
+- [ ] 并发建表 / 删表 / 写入
+- [ ] `make check`（含 `-race`）全绿
+
+**11.8.8 文档**
+
+- [ ] README：表的用法、表名规则、与默认表的关系、迁移说明
+- [ ] 明确「跨表查询」当前不支持
+
+#### 11.9 风险
+
+| 风险 | 应对 |
+| --- | --- |
+| 表名拼进路径导致目录穿越 | 白名单字符集 + 单测覆盖穿越用例 |
+| 大小写不敏感文件系统上的表名撞车 | 拒绝大写；实测验证 |
+| 目录里混入非本程序文件 | 按 magic 区分：是我们的就拒绝启动，不是就跳过告警 |
+| 表过多导致内存膨胀 | 上限 + 每表开销实测后再定具体数值 |
+| 删表时仍有请求在跑 | 表句柄延迟释放：先从 map 摘除，再关闭日志 |
+| 迁移改名失败 | 失败就不启动并说明原因，不半途而废 |
+
+#### 11.10 明确的非目标
+
+- 跨表查询 / 全局搜索（本期只做单表；用户需求里没有要求）
+- 表级别的分析器配置（所有表暂时共用引擎级分析器）
+- 表的别名 / 重命名
+- 跨表事务
+- 每表配额（文档数、磁盘占用上限）
+- 表的权限控制
+
+> 分析器暂时共用是有意的：中文词典加载一次要 700ms 与 100MB，
+> 每个表各来一份不可接受。等真需要差异化分析器时，再考虑共享词典
+> + 每表独立 Segmenter 的做法。
+
+---
+
 ## 7. 测试与验收策略
 
 | 层级 | 手段 | 覆盖对象 |
