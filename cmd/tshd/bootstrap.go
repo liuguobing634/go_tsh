@@ -7,6 +7,7 @@ import (
 
 	"github.com/liuguobing/go_tsh/internal/config"
 	"github.com/liuguobing/go_tsh/internal/corpus"
+	"github.com/liuguobing/go_tsh/internal/tablename"
 	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
 
@@ -38,15 +39,21 @@ func bootstrap(engine *tsh.Engine, cfg config.Config, logger *slog.Logger) error
 		return nil
 	}
 
+	tb, err := targetTable(engine, cfg)
+	if err != nil {
+		return err
+	}
+
 	start := time.Now()
 	for _, d := range docs {
-		if _, err := engine.Upsert(tsh.Document{ID: d.ID, Fields: d.Fields}); err != nil {
+		if _, err := tb.Upsert(tsh.Document{ID: d.ID, Fields: d.Fields}); err != nil {
 			return fmt.Errorf("导入文档 %q 失败: %w", d.ID, err)
 		}
 	}
 
-	st := engine.Stats()
+	st := tb.Stats()
 	logger.Info("语料导入完成",
+		"table", tb.Name(),
 		"docs", st.Docs,
 		"terms", st.Terms,
 		"fields", st.Fields,
@@ -56,4 +63,15 @@ func bootstrap(engine *tsh.Engine, cfg config.Config, logger *slog.Logger) error
 	)
 
 	return nil
+}
+
+// targetTable 决定导入的目标表。
+//
+// 没指定 -import-table 时落到默认表上；指定了就必须**已经存在**——
+// 拼错的表名如果被静默创建，数据就写到了一张谁也不知道的新表里。
+func targetTable(engine *tsh.Engine, cfg config.Config) (*tsh.Table, error) {
+	if cfg.ImportTable != "" {
+		return engine.Table(cfg.ImportTable)
+	}
+	return engine.Table(tablename.Default)
 }

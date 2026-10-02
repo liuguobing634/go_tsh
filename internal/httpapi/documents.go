@@ -60,8 +60,8 @@ func fieldsAsJSON(doc tsh.Document) map[string]any {
 }
 
 // parseDocument 把请求体转换成类型化的文档。
-func parseDocument(s *Server, id string, fields map[string]any) (tsh.Document, error) {
-	return s.engine.ParseDocument(id, fields)
+func parseDocument(tb *tsh.Table, id string, fields map[string]any) (tsh.Document, error) {
+	return tb.ParseDocument(id, fields)
 }
 
 // handleCreateDocument 处理 POST /api/v1/documents。
@@ -70,6 +70,12 @@ func parseDocument(s *Server, id string, fields map[string]any) (tsh.Document, e
 // 混在一起会让「不小心覆盖了别人的文档」变得无声无息。
 // 需要覆盖语义请用 PUT。
 func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
+	tb, err := s.tableFor(r)
+	if err != nil {
+		s.writeMappedError(w, err)
+		return
+	}
+
 	var req documentRequest
 	if err := decodeJSON(r, &req); err != nil {
 		s.writeMappedError(w, err)
@@ -82,20 +88,20 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := parseDocument(s, req.ID, req.Fields)
+	doc, err := parseDocument(tb, req.ID, req.Fields)
 	if err != nil {
 		s.writeMappedError(w, err)
 		return
 	}
 
-	if err := s.engine.Create(doc); err != nil {
+	if err := tb.Create(doc); err != nil {
 		s.writeMappedError(w, err)
 		return
 	}
 
 	// 回显**存储后的结果**而不是请求原文：这样响应里的类型一定与
 	// 索引里的一致，调用方不必再去猜服务端把值当成了什么。
-	s.writeStoredDocument(w, http.StatusCreated, req.ID)
+	s.writeStoredDocument(w, http.StatusCreated, tb, req.ID)
 }
 
 // handlePutDocument 处理 PUT /api/v1/documents/{id}。
@@ -103,6 +109,12 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 // 覆盖式写入：不存在则新建（201），存在则整体替换（200）。
 // 用 201/200 区分这两种情况，让调用方能判断自己是创建者还是覆盖者。
 func (s *Server) handlePutDocument(w http.ResponseWriter, r *http.Request) {
+	tb, err := s.tableFor(r)
+	if err != nil {
+		s.writeMappedError(w, err)
+		return
+	}
+
 	id := strings.TrimSpace(r.PathValue("id"))
 	if id == "" {
 		writeError(w, http.StatusBadRequest, CodeBadRequest, "路径中的文档 id 不能为空")
@@ -122,13 +134,13 @@ func (s *Server) handlePutDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := parseDocument(s, id, req.Fields)
+	doc, err := parseDocument(tb, id, req.Fields)
 	if err != nil {
 		s.writeMappedError(w, err)
 		return
 	}
 
-	created, err := s.engine.Upsert(doc)
+	created, err := tb.Upsert(doc)
 	if err != nil {
 		s.writeMappedError(w, err)
 		return
@@ -138,12 +150,12 @@ func (s *Server) handlePutDocument(w http.ResponseWriter, r *http.Request) {
 	if created {
 		status = http.StatusCreated
 	}
-	s.writeStoredDocument(w, status, id)
+	s.writeStoredDocument(w, status, tb, id)
 }
 
 // writeStoredDocument 取回刚写入的文档并回显。
-func (s *Server) writeStoredDocument(w http.ResponseWriter, status int, id string) {
-	doc, ok := s.engine.GetDocument(id)
+func (s *Server) writeStoredDocument(w http.ResponseWriter, status int, tb *tsh.Table, id string) {
+	doc, ok := tb.GetDocument(id)
 	if !ok {
 		// 刚写完就取不到，说明索引内部出了问题，不能假装成功。
 		s.writeMappedError(w, fmt.Errorf("写入后取回文档 %q 失败", id))
@@ -154,9 +166,15 @@ func (s *Server) writeStoredDocument(w http.ResponseWriter, status int, id strin
 
 // handleGetDocument 处理 GET /api/v1/documents/{id}。
 func (s *Server) handleGetDocument(w http.ResponseWriter, r *http.Request) {
+	tb, err := s.tableFor(r)
+	if err != nil {
+		s.writeMappedError(w, err)
+		return
+	}
+
 	id := strings.TrimSpace(r.PathValue("id"))
 
-	doc, ok := s.engine.GetDocument(id)
+	doc, ok := tb.GetDocument(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, CodeNotFound, "文档不存在: "+id)
 		return
@@ -167,13 +185,19 @@ func (s *Server) handleGetDocument(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteDocument 处理 DELETE /api/v1/documents/{id}。
 func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
+	tb, err := s.tableFor(r)
+	if err != nil {
+		s.writeMappedError(w, err)
+		return
+	}
+
 	id := strings.TrimSpace(r.PathValue("id"))
 	if id == "" {
 		writeError(w, http.StatusBadRequest, CodeBadRequest, "路径中的文档 id 不能为空")
 		return
 	}
 
-	if err := s.engine.Delete(id); err != nil {
+	if err := tb.Delete(id); err != nil {
 		s.writeMappedError(w, err)
 		return
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/liuguobing/go_tsh/internal/index"
 	"github.com/liuguobing/go_tsh/internal/query"
+	"github.com/liuguobing/go_tsh/internal/tablename"
 	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
 
@@ -69,6 +70,18 @@ func (s *Server) writeMappedError(w http.ResponseWriter, err error) {
 	case errors.Is(err, index.ErrDocumentExists):
 		writeError(w, http.StatusConflict, CodeConflict, err.Error())
 		return
+
+	// 表不存在给 404：调用方要能区分「表名拼错了」与「表里没这条数据」。
+	case errors.Is(err, tsh.ErrTableNotFound):
+		writeError(w, http.StatusNotFound, CodeNotFound, err.Error())
+		return
+
+	// 表已存在与表数量超限是两种不同的冲突，但都归 409：
+	// 前者是重复创建，后者是资源上限，都需要调用方改行为而不是改参数。
+	case errors.Is(err, tsh.ErrTableExists),
+		errors.Is(err, tsh.ErrTooManyTables):
+		writeError(w, http.StatusConflict, CodeConflict, err.Error())
+		return
 	}
 
 	// 请求体超限必须排在 errBadBody 之前判断：
@@ -100,7 +113,10 @@ func (s *Server) writeMappedError(w http.ResponseWriter, err error) {
 		errors.Is(err, tsh.ErrUnsupportedFieldType),
 		errors.Is(err, tsh.ErrAmbiguousField),
 		errors.Is(err, tsh.ErrIntegerTooLarge),
-		errors.Is(err, tsh.ErrNoFields):
+		errors.Is(err, tsh.ErrNoFields),
+		errors.Is(err, tsh.ErrCannotDropDefault),
+		errors.Is(err, tsh.ErrEngineClosed),
+		errors.Is(err, tablename.ErrInvalid):
 		writeError(w, http.StatusBadRequest, CodeBadRequest, err.Error())
 		return
 

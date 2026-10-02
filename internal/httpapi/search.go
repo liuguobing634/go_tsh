@@ -36,6 +36,12 @@ type searchHitDTO struct {
 //	field      限定字段，可重复出现；不传表示全部字段
 //	highlight  是否返回高亮片段，默认 false
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	tb, err := s.tableFor(r)
+	if err != nil {
+		s.writeMappedError(w, err)
+		return
+	}
+
 	params := r.URL.Query()
 
 	queryStr := strings.TrimSpace(params.Get("q"))
@@ -70,7 +76,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	res, err := s.engine.Search(tsh.SearchRequest{
+	res, err := tb.Search(tsh.SearchRequest{
 		Query:     queryStr,
 		Fields:    fields,
 		Limit:     limit,

@@ -6,11 +6,15 @@
 package config
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/liuguobing/go_tsh/internal/tablename"
 )
 
 // Config 汇总服务的全部可调参数。
@@ -63,7 +67,7 @@ type Config struct {
 	// 断电最多丢这个间隔内的写。调小更安全但更慢。
 	SyncInterval time.Duration
 
-	// Mapping 预先声明字段类型，格式为 "字段:类型,字段:类型"，
+	// Mapping 预先声明**默认表**的字段类型，格式为 "字段:类型,字段:类型"，
 	// 例如 "created:date,sku:keyword"。
 	//
 	// 数值与布尔可以从 JSON 原生类型直接推断，但**日期与关键字不行**：
@@ -71,6 +75,19 @@ type Config struct {
 	// 靠猜格式是错的——版本号 "2024-01-01" 会被当成日期，
 	// 而这是个很难被发现的静默错误。
 	Mapping string
+
+	// MappingFile 是按表声明字段类型的 JSON 文件：
+	//
+	//	{
+	//	  "products": {"price": "number", "created": "date"},
+	//	  "articles": {"published": "date", "tag": "keyword"}
+	//	}
+	//
+	// 文件里列出的表会在启动时被创建（已存在则沿用）。
+	MappingFile string
+
+	// ImportTable 是 -import / -generate 的目标表，为空表示默认表。
+	ImportTable string
 }
 
 // 支持的字段类型名，与 pkg/tsh 的 FieldKind 对应。
@@ -112,6 +129,58 @@ func ParseMapping(spec string) (map[string]string, error) {
 
 	if len(out) == 0 {
 		return nil, nil
+	}
+	return out, nil
+}
+
+// ParseMappingFile 读取按表声明字段类型的 JSON 文件。
+//
+// 格式：表名 → {字段名: 类型}。表名与类型都在这里校验，
+// 配错了应当在**启动时**就知道，而不是等到第一次写入。
+func ParseMappingFile(path string) (map[string]map[string]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取 mapping 文件失败: %w", err)
+	}
+
+	// 用 map[string]map[string]string 再接一层校验，而不是直接解成
+	// 目标类型：JSON 里的类型名是自由字符串，必须逐个查表。
+	var raw map[string]map[string]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("mapping 文件不是合法的 JSON: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("mapping 文件里没有任何表")
+	}
+
+	out := make(map[string]map[string]string, len(raw))
+	for table, fields := range raw {
+		if err := tablename.Validate(table); err != nil {
+			return nil, fmt.Errorf("mapping 文件里的表名: %w", err)
+		}
+		if len(fields) == 0 {
+			return nil, fmt.Errorf("mapping 文件里表 %q 没有声明任何字段", table)
+		}
+
+		checked := make(map[string]string, len(fields))
+		for field, kind := range fields {
+			field = strings.TrimSpace(field)
+			kind = strings.ToLower(strings.TrimSpace(kind))
+			if field == "" {
+				return nil, fmt.Errorf("mapping 文件里表 %q 有空的字段名", table)
+			}
+			if _, ok := fieldKindNames[kind]; !ok {
+				return nil, fmt.Errorf(
+					"mapping 文件里表 %q 的字段 %q 类型 %q 无法识别，"+
+						"可选 text|keyword|number|date", table, field, kind)
+			}
+			checked[field] = kind
+		}
+		out[table] = checked
 	}
 	return out, nil
 }
@@ -169,7 +238,9 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 	fs.BoolVar(&cfg.NoSubWords, "no-sub-words", cfg.NoSubWords, "关闭中文子词扩展")
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "持久化目录（留空则不持久化）")
 	fs.DurationVar(&cfg.SyncInterval, "sync-interval", cfg.SyncInterval, "批量 fsync 间隔")
-	fs.StringVar(&cfg.Mapping, "mapping", cfg.Mapping, `字段类型声明，如 "created:date,sku:keyword"`)
+	fs.StringVar(&cfg.Mapping, "mapping", cfg.Mapping, `字段类型声明，如 "created:date,sku:keyword"（作用在默认表上）`)
+	fs.StringVar(&cfg.MappingFile, "mapping-file", cfg.MappingFile, "按表声明字段类型的 JSON 文件")
+	fs.StringVar(&cfg.ImportTable, "import-table", cfg.ImportTable, "导入与合成的目标表名，默认为 default")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, fmt.Errorf("解析命令行参数: %w", err)
@@ -272,6 +343,12 @@ func (c Config) Validate() error {
 	// 而不是等到第一次写入才报错。
 	if _, err := ParseMapping(c.Mapping); err != nil {
 		return err
+	}
+
+	if c.ImportTable != "" {
+		if err := tablename.Validate(c.ImportTable); err != nil {
+			return fmt.Errorf("import-table: %w", err)
+		}
 	}
 
 	positiveDurations := []struct {

@@ -18,21 +18,41 @@ func newEngine(cfg config.Config) (*tsh.Engine, error) {
 }
 
 func newEngineWithLogger(cfg config.Config, logger *slog.Logger) (*tsh.Engine, error) {
-	schema, err := config.ParseMapping(cfg.Mapping)
+	// 默认表的 schema：-mapping 的内联形式。
+	inline, err := config.ParseMapping(cfg.Mapping)
 	if err != nil {
 		return nil, err
 	}
 
-	kinds := make(map[string]tsh.FieldKind, len(schema))
-	for name, kind := range schema {
+	kinds := make(map[string]tsh.FieldKind, len(inline))
+	for name, kind := range inline {
 		kinds[name] = tsh.FieldKind(kind)
 	}
 
+	// 其它表的 schema：-mapping-file。
+	//
+	// 文件里列出的表会在构造时被创建，因此「先建表声明类型、
+	// 再慢慢灌数据」在配置层面就能表达。
+	fileSchemas, err := config.ParseMappingFile(cfg.MappingFile)
+	if err != nil {
+		return nil, err
+	}
+
+	tableSchemas := make(map[string]map[string]tsh.FieldKind, len(fileSchemas))
+	for table, fields := range fileSchemas {
+		m := make(map[string]tsh.FieldKind, len(fields))
+		for name, kind := range fields {
+			m[name] = tsh.FieldKind(kind)
+		}
+		tableSchemas[table] = m
+	}
+
 	return tsh.NewWith(tsh.Options{
-		Analyzer:   tsh.AnalyzerKind(cfg.Analyzer),
-		DictPath:   cfg.DictPath,
-		NoSubWords: cfg.NoSubWords,
-		Schema:     kinds,
+		Analyzer:     tsh.AnalyzerKind(cfg.Analyzer),
+		DictPath:     cfg.DictPath,
+		NoSubWords:   cfg.NoSubWords,
+		Schema:       kinds,
+		TableSchemas: tableSchemas,
 
 		DataDir:      cfg.DataDir,
 		SyncInterval: cfg.SyncInterval,

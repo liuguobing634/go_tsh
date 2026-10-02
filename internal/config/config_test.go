@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -301,5 +303,101 @@ func TestMappingConfig(t *testing.T) {
 	}
 	if cfg.Mapping != "created:date" {
 		t.Errorf("从环境变量读到的 mapping = %q", cfg.Mapping)
+	}
+}
+
+func TestParseMappingFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("空路径", func(t *testing.T) {
+		got, err := ParseMappingFile("")
+		if err != nil || got != nil {
+			t.Errorf("空路径应当返回 nil, nil，实际 %v, %v", got, err)
+		}
+	})
+
+	t.Run("正常解析", func(t *testing.T) {
+		p := write("ok.json", `{
+			"products": {"price": "number", "created": "date"},
+			"articles": {"tag": "keyword", "title": "TEXT"}
+		}`)
+		got, err := ParseMappingFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("解析出 %d 张表，want 2（%v）", len(got), got)
+		}
+		if got["products"]["price"] != "number" {
+			t.Errorf("products.price = %q", got["products"]["price"])
+		}
+		// 类型名大小写不敏感
+		if got["articles"]["title"] != "text" {
+			t.Errorf("类型名应当归一成小写，实际 %q", got["articles"]["title"])
+		}
+	})
+
+	t.Run("文件不存在", func(t *testing.T) {
+		if _, err := ParseMappingFile(filepath.Join(dir, "nope.json")); err == nil {
+			t.Error("文件不存在应当报错")
+		}
+	})
+
+	t.Run("非法 JSON", func(t *testing.T) {
+		if _, err := ParseMappingFile(write("bad.json", `{oops`)); err == nil {
+			t.Error("非法 JSON 应当报错")
+		}
+	})
+
+	t.Run("空对象", func(t *testing.T) {
+		if _, err := ParseMappingFile(write("empty.json", `{}`)); err == nil {
+			t.Error("没有任何表应当报错")
+		}
+	})
+
+	t.Run("表名为空", func(t *testing.T) {
+		if _, err := ParseMappingFile(write("noname.json", `{"": {"a":"text"}}`)); err == nil {
+			t.Error("空表名应当报错")
+		}
+	})
+
+	t.Run("非法表名", func(t *testing.T) {
+		if _, err := ParseMappingFile(write("badname.json", `{"Products": {"a":"text"}}`)); err == nil {
+			t.Error("大写表名应当报错")
+		}
+	})
+
+	t.Run("未知类型", func(t *testing.T) {
+		if _, err := ParseMappingFile(write("badkind.json", `{"t": {"a":"martian"}}`)); err == nil {
+			t.Error("未知类型应当报错")
+		}
+	})
+
+	t.Run("表没有字段", func(t *testing.T) {
+		if _, err := ParseMappingFile(write("nofields.json", `{"t": {}}`)); err == nil {
+			t.Error("空字段表应当报错")
+		}
+	})
+}
+
+func TestImportTableConfig(t *testing.T) {
+	cfg, err := Load([]string{"-import-table", "products"}, mapEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ImportTable != "products" {
+		t.Errorf("import-table = %q", cfg.ImportTable)
+	}
+
+	// 非法表名必须在启动时就报错
+	if _, err := Load([]string{"-import-table", "Products"}, mapEnv(nil)); err == nil {
+		t.Error("非法的 import-table 应当让启动失败")
 	}
 }
