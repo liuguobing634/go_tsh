@@ -3,6 +3,8 @@ package wal
 import (
 	"encoding/binary"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -112,7 +114,7 @@ func TestDecodeLegacyV1Upsert(t *testing.T) {
 func TestDecodeUpsertRejectsUnknownVersion(t *testing.T) {
 	payload := EncodeUpsert("doc", map[string]string{"a": "b"}, nil, nil)
 
-	for _, v := range []uint8{0, 3, 99} {
+	for _, v := range []uint8{0, 4, 99} {
 		if _, err := DecodeUpsert(v, payload); !errors.Is(err, errMalformed) {
 			t.Errorf("版本 %d 应当被拒绝，实际: %v", v, err)
 		}
@@ -206,5 +208,127 @@ func TestEncodeUpsertReusesBuffer(t *testing.T) {
 	doc, err := DecodeUpsert(FormatVersion, second)
 	if err != nil || doc.External != "doc-2" {
 		t.Errorf("复用缓冲后解析结果错误: id=%q err=%v", doc.External, err)
+	}
+}
+
+func TestDeclareCodecRoundTrip(t *testing.T) {
+	cases := []struct {
+		name  string
+		kinds map[string]uint8
+	}{
+		{"空声明", map[string]uint8{}},
+		{"单字段", map[string]uint8{"price": KindFieldNumber}},
+		{"多字段", map[string]uint8{
+			"price":   KindFieldNumber,
+			"created": KindFieldDate,
+			"sku":     KindFieldKeyword,
+			"title":   KindFieldText,
+		}},
+		{"非 ASCII 字段名", map[string]uint8{"价格": KindFieldNumber}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DecodeDeclare(EncodeDeclare(tc.kinds, nil))
+			if err != nil {
+				t.Fatalf("解析失败: %v", err)
+			}
+			if len(got) != len(tc.kinds) {
+				t.Fatalf("字段数 = %d, want %d（%v）", len(got), len(tc.kinds), got)
+			}
+			for k, v := range tc.kinds {
+				if got[k] != v {
+					t.Errorf("字段 %q = %d, want %d", k, got[k], v)
+				}
+			}
+		})
+	}
+}
+
+// 声明编码必须确定：map 的遍历顺序是随机的，不排序就会产生不同的字节。
+func TestDeclareEncodingIsDeterministic(t *testing.T) {
+	kinds := map[string]uint8{
+		"zebra": KindFieldNumber, "alpha": KindFieldDate, "中文": KindFieldKeyword,
+		"sku": KindFieldText, "price": KindFieldNumber,
+	}
+
+	first := EncodeDeclare(kinds, nil)
+	for range 20 {
+		again := EncodeDeclare(kinds, nil)
+		if string(again) != string(first) {
+			t.Fatalf("同样的声明产生了不同的字节:\n%v\n%v", first, again)
+		}
+	}
+}
+
+func TestDecodeDeclareRejectsMalformed(t *testing.T) {
+	valid := EncodeDeclare(map[string]uint8{"price": KindFieldNumber}, nil)
+
+	for _, tc := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"空 payload", nil},
+		{"截断", valid[:len(valid)-1]},
+		{"尾部多余字节", append(append([]byte{}, valid...), 0x00)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeDeclare(tc.payload); !errors.Is(err, errMalformed) {
+				t.Errorf("应当返回 errMalformed，实际: %v", err)
+			}
+		})
+	}
+
+	// 空字段名
+	t.Run("空字段名", func(t *testing.T) {
+		b := EncodeDeclare(map[string]uint8{"": KindFieldText}, nil)
+		if _, err := DecodeDeclare(b); !errors.Is(err, errMalformed) {
+			t.Errorf("空字段名应当被拒绝，实际: %v", err)
+		}
+	})
+}
+
+func TestKindDeclareIsKnown(t *testing.T) {
+	if !isKnownKind(KindDeclare) {
+		t.Error("KindDeclare 必须被认作已知类型，否则扫描会把它当成文件尾部")
+	}
+	if KindDeclare.String() != "declare" {
+		t.Errorf("KindDeclare.String() = %q", KindDeclare.String())
+	}
+}
+
+// **v2 的日志必须仍能被 v3 读到。**
+//
+// 升级格式就拒绝启动、逼用户删数据重来是最差的处理方式：
+// v2 的数据是完全可解析的，只是没有 declare 记录而已。
+func TestV2LogRemainsReadable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v2.wal")
+
+	// 手工造一份 v2 格式的日志：文件头版本写 2，记录与 v3 的 upsert 布局相同
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 文件头是 8 字节：4 字节魔数 + 1 字节版本 + 3 字节保留。
+	header := make([]byte, headerSize)
+	copy(header, Magic)
+	header[4] = 2
+	if _, err := f.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 用 v3 打开它：应当被接受，但不该往里面追加 v3 记录
+	log, err := Open(path, Options{SyncInterval: 10e6})
+	if err != nil {
+		t.Fatalf("v2 日志应当能被打开: %v", err)
+	}
+	defer log.Close()
+
+	if got := log.Version(); got != 2 {
+		t.Errorf("读到的版本 = %d, want 2（解码方必须按日志自身的版本，而不是编译期常量）", got)
 	}
 }

@@ -194,6 +194,16 @@ func NewWith(opts Options) (*Engine, error) {
 		opts:   opts,
 	}
 
+	// ⚠️ 迁移必须排在**打开任何表之前**。
+	//
+	// 否则默认表的日志文件会先被 openTable 创建出来，迁移就会因为
+	// 「目标已存在」而跳过——旧数据被静默忽略，用户看到的是
+	// 「升级之后数据没了」。这个顺序错误一度真的存在，是
+	// TestLegacyLogIsMigrated 抓出来的。
+	if err := migrateLegacyLog(opts.DataDir, opts.Logger); err != nil {
+		return nil, err
+	}
+
 	schemas, err := collectSchemas(opts)
 	if err != nil {
 		return nil, err
@@ -208,14 +218,6 @@ func NewWith(opts Options) (*Engine, error) {
 
 	// 数据目录里已存在的其它表。
 	if opts.DataDir != "" {
-		// 迁移必须排在扫描**之前**：旧日志要被认成 default 表，
-		// 否则扫描时看不到它，默认表就会以空索引启动——
-		// 数据还在磁盘上，但用户看到的是「数据没了」。
-		if err := migrateLegacyLog(opts.DataDir, opts.Logger); err != nil {
-			e.closeAll()
-			return nil, err
-		}
-
 		names, err := discoverTables(opts.DataDir, opts.Logger)
 		if err != nil {
 			e.closeAll()

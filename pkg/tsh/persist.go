@@ -100,10 +100,17 @@ func (p *persistState) apply(c index.Change) error {
 		payload []byte
 	)
 
-	if c.Deleted {
+	switch {
+	case len(c.Declared) > 0:
+		// 字段类型声明：让没有文档的表也能把 schema 落盘。
+		kind = wal.KindDeclare
+		payload = wal.EncodeDeclare(kindBytes(c.Declared), p.scratch[:0])
+
+	case c.Deleted:
 		kind = wal.KindDelete
 		payload = wal.EncodeDelete(c.External, p.scratch[:0])
-	} else {
+
+	default:
 		kind = wal.KindUpsert
 		// 字段类型必须落盘，否则重启重放时 number/date 会退化成 text，
 		// 动态映射的结果就和重启前不一致了——症状是「重启后范围查询
@@ -165,6 +172,7 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 	var (
 		upserts  int
 		deletes  int
+		declares int
 		skipped  int
 		recordNo int
 	)
@@ -173,6 +181,21 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 		recordNo++
 
 		switch k {
+		case wal.KindDeclare:
+			// 字段类型声明。它通常出现在文档之前（建表时写下），
+			// 也可能夹在文档之间（动态映射后来才遇到新字段）。
+			kinds, err := wal.DecodeDeclare(payload)
+			if err != nil {
+				return fmt.Errorf("第 %d 条记录（declare）解析失败: %w", recordNo, err)
+			}
+			// 走 declareKinds 而不是直接调 DeclareField：重放期间
+			// 钩子会因为 replaying 标志直接返回，不会把读到的声明
+			// 又写回日志。
+			if err := declareKinds(idx, kinds); err != nil {
+				return fmt.Errorf("第 %d 条记录重放字段类型声明失败: %w", recordNo, err)
+			}
+			declares++
+
 		case wal.KindUpsert:
 			// 版本从**日志本身**取，不用编译期常量：读到旧日志时布局不同，
 			// 按新布局解析会读出一堆乱码。
@@ -218,9 +241,9 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 		return err
 	}
 
-	if logger != nil && (upserts > 0 || deletes > 0) {
+	if logger != nil && (upserts > 0 || deletes > 0 || declares > 0) {
 		logger.Info("持久化日志重放完成",
-			"upserts", upserts, "deletes", deletes,
+			"upserts", upserts, "deletes", deletes, "declares", declares,
 			"skipped_deletes", skipped, "log_bytes", p.log.Size())
 	}
 	return nil

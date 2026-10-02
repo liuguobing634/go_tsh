@@ -50,6 +50,16 @@ type Change struct {
 
 	// Deleted 为 true 表示这是一次删除。
 	Deleted bool
+
+	// Declared 非空表示这是一次**字段类型声明**，而不是文档变更。
+	//
+	// 它的存在是为了让「建表时声明好字段类型、但还没写任何文档」的表
+	// 能把 schema 落盘——否则重启后那张表的类型信息就丢了，
+	// 而写进去的数据会被按推断的类型重新解释。
+	//
+	// 互斥约定：Declared 非空时，External / Fields / Kinds / Deleted
+	// 都没有意义。
+	Declared map[string]FieldKind
 }
 
 // Options 配置倒排索引；零值即为一套合理默认。

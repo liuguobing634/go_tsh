@@ -166,8 +166,11 @@ func numericFingerprint(t *testing.T, e *Engine) []string {
 	return out
 }
 
-// 日志文件必须是 v2：v1 的格式里没有类型字节。
-func TestLogIsWrittenAsV2(t *testing.T) {
+// 日志文件必须写成**当前**格式版本。
+//
+// 这个测试查的是文件头里的实际字节，而不是 wal.FormatVersion 常量——
+// 后者是「我们以为会写的」，前者才是真的写下去了。
+func TestLogIsWrittenAsCurrentVersion(t *testing.T) {
 	dir := t.TempDir()
 
 	e := openPersistent(t, dir)
@@ -183,8 +186,8 @@ func TestLogIsWrittenAsV2(t *testing.T) {
 	if raw != wal.FormatVersion {
 		t.Errorf("日志版本 = %d, want %d", raw, wal.FormatVersion)
 	}
-	if wal.FormatVersion != 2 {
-		t.Errorf("本测试的前提是当前格式为 v2，实际 %d", wal.FormatVersion)
+	if wal.FormatVersion < 2 {
+		t.Errorf("v1 没有类型字节，当前版本不该回到 %d", wal.FormatVersion)
 	}
 }
 

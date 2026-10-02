@@ -79,6 +79,10 @@ func ParseFieldKind(s string) (FieldKind, error) {
 // 类型冲突返回 ErrFieldKindConflict，**不做静默强转**。
 // 强转看起来"更宽容"，实际会把「同一字段一半是数字一半是文本」
 // 这种脏数据悄悄放进来，等到查询时才发现，那时已经很难追查了。
+//
+// **只有真正新增的声明才会触发 OnApply 钩子**（见 Change.Declared）。
+// 这一点很关键：DeclareField 每次写入都会被调用，如果每次都记一条日志，
+// 日志会被这种无变化的声明刷满。
 func (ix *InvertedIndex) DeclareField(field string, kind FieldKind) error {
 	field = strings.TrimSpace(field)
 	if field == "" {
@@ -88,16 +92,35 @@ func (ix *InvertedIndex) DeclareField(field string, kind FieldKind) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
-	if existing, ok := ix.schema[field]; ok && existing != kind {
-		return fmt.Errorf("%w: 字段 %q 已经是 %s 类型，不能改成 %s"+
-			"（同一字段在一份索引里只能有一种类型）",
-			ErrFieldKindConflict, field, existing, kind)
+	if existing, ok := ix.schema[field]; ok {
+		if existing != kind {
+			return fmt.Errorf("%w: 字段 %q 已经是 %s 类型，不能改成 %s"+
+				"（同一字段在一份索引里只能有一种类型）",
+				ErrFieldKindConflict, field, existing, kind)
+		}
+		// 已声明过同一个类型：什么都不用做，也不必记日志。
+		return nil
 	}
 
 	ix.schema[field] = kind
 
 	if kind.Numeric() && ix.numColumns[field] == nil {
 		ix.numColumns[field] = &numericColumn{}
+	}
+
+	// 新增声明要落盘。
+	//
+	// 否则「建表声明好字段类型、还没写任何文档」的表重启后 schema 就丢了——
+	// 而「先建表、再慢慢灌数据」恰恰是最常见的用法。
+	//
+	// 钩子在**写锁内**调用，因此声明记录与随后的文档记录顺序一致；
+	// 重放时按同样的顺序重放，schema 就能原样复现。
+	if ix.onApply != nil {
+		if err := ix.onApply(Change{Declared: map[string]FieldKind{field: kind}}); err != nil {
+			// 索引的 schema 已经改了，这里无法回滚。
+			// 把错误抛出去让调用方（通常是持久化层）决定怎么办。
+			return err
+		}
 	}
 	return nil
 }

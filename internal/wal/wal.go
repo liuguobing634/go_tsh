@@ -42,14 +42,20 @@ const (
 
 	// FormatVersion 是当前写入的格式版本。
 	//
-	// v2 相对 v1 的变化：upsert 记录里每个字段多一个类型字节。
-	// 起因是索引引入了类型化字段（number / date），而动态映射要求
-	// 重启重放能复现同样的类型——只存文本是复现不出来的。
-	FormatVersion uint8 = 2
-
-	// legacyFormatVersion 是仍然可以**读**的旧版本。
+	// 版本历史：
+	//   - v1：upsert 只有「名字 + 值」
+	//   - v2：upsert 每个字段多一个类型字节（动态映射要在重启后复现）
+	//   - v3：新增声明字段类型的记录类型（空表的 schema 也要活过重启）
 	//
-	// 兼容读取而不是拒绝启动：v1 的数据完全可解析（全部按 text 处理），
+	// v3 并没有改变已有记录的**布局**——它只是多了一种记录类型。
+	// 之所以仍然要升版本号：旧二进制读到不认识的类型会把它当成
+	// 损坏数据并拒绝启动，那个报错（「日志损坏」）会把人引向完全
+	// 错误的方向。升版本号能让它干净地说出「版本不支持」。
+	FormatVersion uint8 = 3
+
+	// legacyFormatVersion 是仍然可以**读**的最旧版本。
+	//
+	// 兼容读取而不是拒绝启动：旧数据完全可解析，
 	// 逼用户删数据重来是最差的处理方式。
 	legacyFormatVersion uint8 = 1
 
@@ -76,7 +82,30 @@ const (
 
 	// KindDelete 表示删除。
 	KindDelete Kind = 2
+
+	// KindDeclare 表示「这些字段的类型是这样」。
+	//
+	// 它让**没有文档的表**也能把 schema 落盘。
+	// 没有它的话，「建表声明好字段类型、再慢慢灌数据」这种最常见的用法
+	// 在重启后会丢掉全部类型信息，之后写进去的数据会被按推断的类型
+	// 重新解释——数字变成文本，范围查询随之失效。
+	KindDeclare Kind = 3
 )
+
+// knownKinds 是当前能识别的全部记录类型。
+//
+// 扫描时用它判断记录是否有效：认不出的类型会让扫描在**该条记录的开头**
+// 停下，并被当成文件尾部截断处理。
+var knownKinds = [...]Kind{KindUpsert, KindDelete, KindDeclare}
+
+func isKnownKind(k Kind) bool {
+	for _, known := range knownKinds {
+		if k == known {
+			return true
+		}
+	}
+	return false
+}
 
 func (k Kind) String() string {
 	switch k {
@@ -84,6 +113,8 @@ func (k Kind) String() string {
 		return "upsert"
 	case KindDelete:
 		return "delete"
+	case KindDeclare:
+		return "declare"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint8(k))
 	}
@@ -238,9 +269,14 @@ func (l *Log) recover() error {
 		return fmt.Errorf("%w: 期望魔数 %q，实际 %q",
 			ErrFormatMismatch, Magic, string(header[:4]))
 	}
-	if header[4] != FormatVersion && header[4] != legacyFormatVersion {
-		return fmt.Errorf("%w: 期望版本 %d（也接受旧版 %d），实际 %d",
-			ErrFormatMismatch, FormatVersion, legacyFormatVersion, header[4])
+	// 版本必须落在 [legacyFormatVersion, FormatVersion] 区间内。
+	//
+	// 用区间而不是「等于当前版本或等于最旧版本」——后者在版本多于两个时
+	// 会静默地把中间那些版本拒之门外。v2 就是这么被漏掉的：
+	// 升到 v3 之后，所有已有的 v2 日志都打不开了。
+	if header[4] < legacyFormatVersion || header[4] > FormatVersion {
+		return fmt.Errorf("%w: 版本 %d 不在支持范围 [%d, %d] 内",
+			ErrFormatMismatch, header[4], legacyFormatVersion, FormatVersion)
 	}
 	// 记下这份日志的实际版本：解码方必须按它来，而不是按编译期常量。
 	l.version = header[4]
@@ -307,7 +343,7 @@ func (l *Log) scan(size int64) (validEnd, badAt int64, err error) {
 		kind := Kind(prefix[0])
 		n := binary.LittleEndian.Uint32(prefix[1:5])
 
-		if kind != KindUpsert && kind != KindDelete {
+		if !isKnownKind(kind) {
 			return off, off, nil
 		}
 		if int64(n) > int64(l.maxRec) {

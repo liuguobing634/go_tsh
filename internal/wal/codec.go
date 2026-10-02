@@ -84,6 +84,67 @@ func EncodeDelete(external string, dst []byte) []byte {
 	return appendString(dst, external)
 }
 
+// EncodeDeclare 把一组字段类型声明编码成 declare 记录的 payload。
+//
+// 与 EncodeUpsert 一样按字段名排序：map 的遍历顺序是随机的，
+// 不排序会让同样的声明产生不同的字节，日志就没法逐字节比较了。
+func EncodeDeclare(kinds map[string]uint8, dst []byte) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(kinds)))
+
+	names := make([]string, 0, len(kinds))
+	for name := range kinds {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	for _, name := range names {
+		dst = append(dst, kinds[name])
+		dst = appendString(dst, name)
+	}
+	return dst
+}
+
+// DecodeDeclare 解析 declare 记录的 payload。
+func DecodeDeclare(payload []byte) (map[string]uint8, error) {
+	count, m := binary.Uvarint(payload)
+	if m <= 0 {
+		return nil, errMalformed
+	}
+	off := m
+
+	// 字段数不可信：每个字段至少要占几个字节，先跟剩余长度比一次。
+	if count > uint64(len(payload)-off) {
+		return nil, fmt.Errorf("%w: 声明字段数 %d 超出剩余数据所能表达的上限",
+			errMalformed, count)
+	}
+
+	out := make(map[string]uint8, count)
+	for i := uint64(0); i < count; i++ {
+		if off >= len(payload) {
+			return nil, errMalformed
+		}
+		kind := payload[off]
+		off++
+
+		name, next, err := readString(payload, off)
+		if err != nil {
+			return nil, err
+		}
+		off = next
+
+		if name == "" {
+			return nil, fmt.Errorf("%w: 声明的字段名不能为空", errMalformed)
+		}
+		out[name] = kind
+	}
+
+	if off != len(payload) {
+		return nil, fmt.Errorf("%w: declare 记录尾部多了 %d 字节",
+			errMalformed, len(payload)-off)
+	}
+	return out, nil
+}
+
 // Document 是一条 upsert 记录解码后的内容。
 type Document struct {
 	External string
@@ -96,17 +157,21 @@ type Document struct {
 // DecodeUpsert 解析 upsert 记录的 payload。
 //
 // version 决定 payload 的布局：
-//   - 2：每个字段前有一个类型字节
+//   - 2 及更高：每个字段前有一个类型字节
 //   - 1：只有「名字 + 值」，全部按 text 处理
 //
-// 保留 v1 是为了**不破坏已经写下的日志**。升级格式就直接拒绝启动、
-// 逼用户删数据重来，是最差的处理方式——那些数据是完全可读的。
+// **按「布局世代」而不是「精确版本」判断**：v3 只是多了一种记录类型，
+// upsert 的布局与 v2 完全一样。写成 `case 1, 2` 会在升级到 v3 的那一刻
+// 让所有文档重放集体失败——而空表（只有 declare 记录）测不出来，
+// 这个坑真的踩过一次。
 func DecodeUpsert(version uint8, payload []byte) (Document, error) {
 	switch version {
-	case 1, 2:
+	case 1, 2, 3:
 	default:
 		return Document{}, fmt.Errorf("%w: 不支持的重放版本 %d", errMalformed, version)
 	}
+	// v1 是唯一没有类型字节的世代。
+	hasKinds := version >= 2
 
 	external, off, err := readString(payload, 0)
 	if err != nil {
@@ -136,7 +201,7 @@ func DecodeUpsert(version uint8, payload []byte) (Document, error) {
 
 	for i := uint64(0); i < count; i++ {
 		var kind uint8
-		if version >= 2 {
+		if hasKinds {
 			if off >= len(payload) {
 				return Document{}, errMalformed
 			}
