@@ -4,11 +4,11 @@
 
 > 当前进度：**Phase 0–5 全部完成**，并已加入**中文分词与检索**、
 > **L1 文档持久化**（追加式原文日志 + 启动重放）、
-> **类型化字段与范围查询**。
+> **类型化字段与范围查询**、**表（多命名空间）**。
 > 10 万篇规模下检索 P99 < 20ms；`make check`（含 `-race`）全绿。
 > 性能数据与压测记录见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，
 > 中文支持的实测对比与设计见 [docs/CHINESE.md](docs/CHINESE.md)，
-> 持久化方案、实测代价与后续计划见 [PLAN.md](PLAN.md) 的 Phase 8。
+> 持久化与表的方案、实测代价与后续计划见 [PLAN.md](PLAN.md) 的 Phase 8 / 11。
 
 > **依赖说明（相对原计划的修订）**
 >
@@ -36,6 +36,7 @@
 - **中文检索**：词典分词 + 子词扩展（`-analyzer chinese`）
 - **持久化**：追加式原文日志 + 启动重放（`-data-dir`），崩溃可恢复
 - **类型化字段**：数值与时间的等值/范围查询、关键字精确匹配
+- **表（多命名空间）**：商品只查商品、资讯只查资讯，各表独立 schema
 - 标准库实现：`net/http`、`log/slog`、`encoding/json`
 
 ## 快速开始
@@ -203,6 +204,76 @@ title:笔记本                      字段限定的文本查询
 - 范围查询是 **O(文档数)** 的线性扫描（按 DocID 顺序，输出天然有序）。
   10 万篇实测 0.2 ms，但千万篇会到 20 ms，那时需要换实现。
 
+## 表（多命名空间）
+
+把不同内容分开放，商品只查商品、资讯只查资讯。
+
+```powershell
+# 建表并声明字段类型
+curl.exe --noproxy "*" -X PUT -H "Content-Type: application/json" `
+  -d '{"schema":{"name":"text","price":"number","created":"date","sku":"keyword"}}' `
+  http://127.0.0.1:8080/api/v1/tables/products
+
+# 写进这张表
+curl.exe --noproxy "*" -X PUT -H "Content-Type: application/json" `
+  -d '{"fields":{"name":"笔记本电脑","price":4999,"sku":"LAP-1"}}' `
+  http://127.0.0.1:8080/api/v1/tables/products/documents/p1
+
+# 只在这张表里搜
+curl.exe --noproxy "*" "http://127.0.0.1:8080/api/v1/tables/products/search?q=price:%5B0%20TO%206000%5D"
+```
+
+| 端点 | 作用 |
+| --- | --- |
+| `GET /api/v1/tables` | 列出所有表（含各自的 schema 与统计） |
+| `PUT /api/v1/tables/{table}` | 建表（**幂等**，body 可带 schema） |
+| `GET /api/v1/tables/{table}` | 表详情 |
+| `DELETE /api/v1/tables/{table}` | 删表 |
+| `* /api/v1/tables/{table}/documents[/{id}]` | 表内文档增删改查 |
+| `GET /api/v1/tables/{table}/search` | 表内检索 |
+
+### 每张表是独立的索引
+
+这不是组织方式上的包装，而是**硬性要求**：字段类型是索引级的，
+同一个字段名在一份索引里只能有一种类型。所以「商品表的 `price` 是数字、
+资讯表的 `price` 是字符串编号」这种再正常不过的需求，只有让每张表
+拥有独立索引才能成立。
+
+顺带的好处是**查询只扫自己的表**——查商品不会去扫资讯的 posting。
+
+### 表名规则
+
+只允许**小写字母、数字、下划线、连字符**，首字符必须是字母或数字，
+长度 1–64。
+
+**不允许大写**不是洁癖：Windows 与 macOS 的文件系统**大小写不敏感**，
+`Products.wal` 与 `products.wal` 是同一个文件（实测确认：
+依次写入两个名字后目录里只有一个文件，`os.SameFile` 返回 true）。
+允许大写就意味着两张表共用一份日志、数据互相污染——而这个问题
+在 Linux 上完全测不出来。
+
+### 几点需要知道的
+
+- **不会自动建表**。往不存在的表写入返回 404 而不是顺手创建——
+  表名拼错却静默产生一张新表，在导入管道里极难发现。
+- **默认表 `default` 不能删**。旧的扁平路由（`/api/v1/documents`、
+  `/api/v1/search`）都指向它，删掉会让一半接口失去目标。
+- **每张表一个日志文件**：`<data-dir>/tables/<name>.wal`。
+  删表就是删文件。旧布局的 `<data-dir>/documents.wal` 会在启动时
+  自动迁移成 `tables/default.wal`。
+- **暂不支持跨表查询**。要同时搜多张表请分别调用再自行合并。
+- 所有表共用同一个分析器：中文词典加载一次要几百毫秒与上百 MB，
+  每张表各来一份不可接受。
+
+配置文件里批量声明（`-mapping-file`）：
+
+```json
+{
+  "products": {"name": "text", "price": "number", "created": "date"},
+  "articles": {"title": "text", "price": "keyword", "published": "date"}
+}
+```
+
 ## 容器与 CI
 
 ```bash
@@ -250,7 +321,9 @@ CI runner 能直连 `proxy.golang.org`，不需要镜像配置；
 | `-no-sub-words` | `TSH_NO_SUB_WORDS` | `false` | 关闭中文子词扩展；需 `-analyzer chinese` |
 | `-data-dir` | `TSH_DATA_DIR` | 空 | 持久化目录；**留空即纯内存，重启丢失** |
 | `-sync-interval` | `TSH_SYNC_INTERVAL` | `100ms` | 批量 fsync 间隔，必须为正 |
-| `-mapping` | `TSH_MAPPING` | 空 | 字段类型声明，如 `"created:date,sku:keyword"` |
+| `-mapping` | `TSH_MAPPING` | 空 | 默认表的字段类型声明，如 `"created:date"` |
+| `-mapping-file` | `TSH_MAPPING_FILE` | 空 | 按表声明字段类型的 JSON 文件 |
+| `-import-table` | `TSH_IMPORT_TABLE` | `default` | `-import` / `-generate` 的目标表 |
 | `-mapping` | `TSH_MAPPING` | 空 | 字段类型声明，如 `created:date,sku:keyword` |
 | `-max-body-bytes` | `TSH_MAX_BODY_BYTES` | `8388608` | 单请求体字节上限（8 MiB） |
 | `-max-doc-fields` | `TSH_MAX_DOC_FIELDS` | `32` | 单文档字段数上限 |
