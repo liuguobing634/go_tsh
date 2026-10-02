@@ -48,13 +48,13 @@ type SearchResult struct {
 //
 // 查询串的错误（ErrEmptyQuery / ErrTooManyClauses / *query.SyntaxError）
 // 原样返回，HTTP 层据此映射成 400。
-func (e *Engine) Search(req SearchRequest) (SearchResult, error) {
-	node, err := query.Parse(req.Query, e.popts)
+func (t *Table) Search(req SearchRequest) (SearchResult, error) {
+	node, err := query.Parse(req.Query, t.popts)
 	if err != nil {
 		return SearchResult{}, err
 	}
 
-	res, err := e.search.Search(node, query.SearchOptions{
+	res, err := t.search.Search(node, query.SearchOptions{
 		Fields: req.Fields,
 		Limit:  req.Limit,
 		Offset: req.Offset,
@@ -70,7 +70,7 @@ func (e *Engine) Search(req SearchRequest) (SearchResult, error) {
 
 	var terms []string
 	if req.Highlight {
-		terms = e.search.QueryTerms(node)
+		terms = t.search.QueryTerms(node)
 	}
 
 	// View 内只做廉价的事：按 DocID 取文档副本。
@@ -84,7 +84,7 @@ func (e *Engine) Search(req SearchRequest) (SearchResult, error) {
 	}
 
 	docs := make([]fetched, 0, len(res.Hits))
-	e.idx.View(func(v *index.View) {
+	t.idx.View(func(v *index.View) {
 		for _, h := range res.Hits {
 			doc, ok := v.Document(h.ID)
 			if !ok {
@@ -103,7 +103,7 @@ func (e *Engine) Search(req SearchRequest) (SearchResult, error) {
 		if len(terms) > 0 {
 			hl := make(map[string]string)
 			for field, text := range d.fields {
-				if snippet := e.hl.Highlight(text, terms); snippet != "" {
+				if snippet := t.hl.Highlight(text, terms); snippet != "" {
 					hl[field] = snippet
 				}
 			}

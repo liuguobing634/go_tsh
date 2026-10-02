@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/liuguobing/go_tsh/internal/index"
+	"github.com/liuguobing/go_tsh/internal/tablename"
 	"github.com/liuguobing/go_tsh/internal/wal"
 )
 
@@ -109,7 +110,7 @@ func TestTypedFieldsSurviveRestart(t *testing.T) {
 		{"created", index.FieldDate},
 		{"sku", index.FieldKeyword},
 	} {
-		got, ok := e2.idx.FieldKindOf(tc.field)
+		got, ok := defaultIdx(e2).FieldKindOf(tc.field)
 		if !ok {
 			t.Errorf("重启后字段 %q 的类型丢失了", tc.field)
 			continue
@@ -178,7 +179,7 @@ func TestLogIsWrittenAsV2(t *testing.T) {
 	}
 
 	// 直接读文件头的版本字节
-	raw := readHeader(t, filepath.Join(dir, documentsLogName))
+	raw := readHeader(t, filepath.Join(dir, tablesSubdir, tablename.Default+logExt))
 	if raw != wal.FormatVersion {
 		t.Errorf("日志版本 = %d, want %d", raw, wal.FormatVersion)
 	}
@@ -186,3 +187,8 @@ func TestLogIsWrittenAsV2(t *testing.T) {
 		t.Errorf("本测试的前提是当前格式为 v2，实际 %d", wal.FormatVersion)
 	}
 }
+
+// defaultIdx 取默认表的底层索引，供测试直接检查内部状态。
+//
+// 有了表之后 Engine 不再直接持有索引，测试得先拿到默认表。
+func defaultIdx(e *Engine) *index.InvertedIndex { return e.defaultTable().idx }

@@ -3,17 +3,39 @@ package tsh
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/liuguobing/go_tsh/internal/index"
+	"github.com/liuguobing/go_tsh/internal/tablename"
 	"github.com/liuguobing/go_tsh/internal/wal"
 )
 
-// documentsLogName 是持久化日志的文件名。
-const documentsLogName = "documents.wal"
+const (
+	// logExt 是每张表的日志文件扩展名。
+	logExt = ".wal"
+
+	// tablesSubdir 是数据目录下存放各表日志的子目录。
+	//
+	// 用子目录而不是平铺：以后要放表级元数据（配额、统计）时有地方放，
+	// 而扫描时也不会把数据目录里的其它东西卷进来。
+	tablesSubdir = "tables"
+
+	// legacyDocumentsLogName 是引入表之前的全局日志名。
+	//
+	// 只用于迁移，新代码不再往这个路径写。
+	legacyDocumentsLogName = "documents.wal"
+)
+
+// documentsLogName 是旧布局的日志文件名。保留这个名字是为了让既有测试
+// 与迁移逻辑共用一处定义。
+const documentsLogName = legacyDocumentsLogName
 
 // ErrPersistenceBroken 表示持久化层已经失败，写请求被拒绝。
 //
@@ -204,20 +226,212 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 	return nil
 }
 
-// openPersist 打开持久化日志。dataDir 为空时返回 (nil, nil)，
-// 表示不持久化——此时引擎的行为与纯内存版本完全一致。
-func openPersist(dataDir string, syncInterval time.Duration, logger *slog.Logger) (*persistState, error) {
+// openPersist 打开某张表的持久化日志。
+//
+// dataDir 为空时返回 (nil, nil)，表示不持久化——此时引擎的行为与纯内存
+// 版本完全一致。
+func openPersist(
+	dataDir, table string,
+	syncInterval time.Duration,
+	logger *slog.Logger,
+) (*persistState, error) {
 	if dataDir == "" {
 		return nil, nil
 	}
 
-	log, err := wal.Open(filepath.Join(dataDir, documentsLogName), wal.Options{
+	// 表名在这里再校验一次，而不是只信任调用方。
+	//
+	// 表名要拼进文件路径，任何一条没经过校验的路径都是目录穿越。
+	// 多校验一次的代价是一次几纳秒的字符串扫描。
+	if err := tablename.Validate(table); err != nil {
+		return nil, err
+	}
+
+	dir := tablesDir(dataDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("tsh: 创建表目录失败: %w", err)
+	}
+
+	log, err := wal.Open(filepath.Join(dir, table+logExt), wal.Options{
 		SyncInterval: syncInterval,
 		Logger:       logger,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("tsh: 打开持久化日志失败: %w", err)
+		return nil, fmt.Errorf("tsh: 打开表 %q 的持久化日志失败: %w", table, err)
 	}
 
 	return &persistState{log: log}, nil
+}
+
+// tablesDir 返回存放各表日志的目录。
+func tablesDir(dataDir string) string { return filepath.Join(dataDir, tablesSubdir) }
+
+// removeTableFile 删除某张表的日志文件。
+//
+// 文件不存在不算错误：删表是幂等的目标状态，而不是「必须删掉一个东西」。
+func removeTableFile(dataDir, table string) error {
+	if dataDir == "" {
+		return nil
+	}
+	if err := tablename.Validate(table); err != nil {
+		return err
+	}
+
+	path := filepath.Join(tablesDir(dataDir), table+logExt)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("tsh: 删除表 %q 的日志失败: %w", table, err)
+	}
+	return nil
+}
+
+// discoverTables 扫描数据目录，返回已存在的表名。
+//
+// 目录里的文件分三类，处理方式不同：
+//
+//  1. 合法表名 + 本程序的魔数 → 那就是一张表。
+//  2. **魔数正确但表名不合法** → **拒绝启动**。
+//     那是我们的数据，只是名字被改过。静默跳过等于无声地丢一整个表。
+//  3. 没有魔数 → 不是我们的文件，跳过并告警。
+//     目录里混进 README、.DS_Store、用户随手拷来的东西都很常见，
+//     为此拒绝启动只会让人摸不着头脑。
+//
+// 只看魔数不看扩展名：扩展名是约定，魔数才是事实。
+func discoverTables(dataDir string, logger *slog.Logger) ([]string, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+
+	dir := tablesDir(dataDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 还没建过任何表，正常情况。
+			return nil, nil
+		}
+		return nil, fmt.Errorf("tsh: 读取表目录失败: %w", err)
+	}
+
+	var (
+		names   []string
+		skipped []string
+	)
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+
+		name := e.Name()
+		if !strings.HasSuffix(name, logExt) {
+			skipped = append(skipped, name)
+			continue
+		}
+
+		table := strings.TrimSuffix(name, logExt)
+		path := filepath.Join(dir, name)
+
+		ours, err := hasOurMagic(path)
+		if err != nil {
+			return nil, fmt.Errorf("tsh: 读取 %s 失败: %w", path, err)
+		}
+
+		if !ours {
+			skipped = append(skipped, name)
+			continue
+		}
+
+		if err := tablename.Validate(table); err != nil {
+			return nil, fmt.Errorf(
+				"tsh: %s 是本程序的日志（魔数正确），但文件名不是合法表名：%w。"+
+					"这是数据，不能跳过；请改名或移走后再启动", path, err)
+		}
+		names = append(names, table)
+	}
+
+	if logger != nil && len(skipped) > 0 {
+		logger.Warn("表目录里有非本程序的文件，已跳过",
+			"dir", dir, "files", skipped)
+	}
+
+	slices.Sort(names)
+	return names, nil
+}
+
+// hasOurMagic 判断文件是否是我们写的日志。
+func hasOurMagic(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, len(wal.Magic))
+	n, err := io.ReadFull(f, buf)
+	if err != nil {
+		// 空文件或短文件：不是完整的日志，但不是读错误。
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	return n == len(wal.Magic) && string(buf) == wal.Magic, nil
+}
+
+// migrateLegacyLog 把旧布局的 <dataDir>/documents.wal 迁移到
+// <dataDir>/tables/default.wal。
+//
+// 老版本只有一个全局日志。引入表之后它天然对应默认表。
+//
+// 只在「旧文件在、新文件不在」时动手，因此是幂等的：
+// 迁移过一次之后这个函数就永远走空了。
+//
+// 用改名而不是「继续读老路径」：两条路径并存意味着两套代码分支，
+// 而这是一次性的迁移，做完就干净了。目标文件不存在，所以不涉及
+// os.Rename 在 Windows 上的覆盖语义（那条风险更高，这里避开了）。
+func migrateLegacyLog(dataDir string, logger *slog.Logger) error {
+	if dataDir == "" {
+		return nil
+	}
+
+	oldPath := filepath.Join(dataDir, documentsLogName)
+	newPath := filepath.Join(tablesDir(dataDir), tablename.Default+logExt)
+
+	oldInfo, err := os.Stat(oldPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 没有旧文件，最常见的情况
+		}
+		return fmt.Errorf("tsh: 检查旧日志 %s 失败: %w", oldPath, err)
+	}
+	if oldInfo.IsDir() {
+		return nil
+	}
+
+	if _, err := os.Stat(newPath); err == nil {
+		// 两个都在：说明已经迁移过，而旧文件是用户自己又放回来的。
+		// 不动它，但要明确告警——否则用户会以为自己的数据被读了。
+		if logger != nil {
+			logger.Warn("旧日志与新布局同时存在，已忽略旧文件",
+				"old", oldPath, "new", newPath)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("tsh: 检查 %s 失败: %w", newPath, err)
+	}
+
+	if err := os.MkdirAll(tablesDir(dataDir), 0o755); err != nil {
+		return fmt.Errorf("tsh: 创建表目录失败: %w", err)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		// 改名失败就不启动。半途而废会让用户既看不到旧数据、
+		// 也不知道新数据该往哪写。
+		return fmt.Errorf(
+			"tsh: 迁移旧日志失败（%s -> %s）: %w；"+
+				"请手动改名后重试", oldPath, newPath, err)
+	}
+
+	if logger != nil {
+		logger.Info("已把旧日志迁移到默认表", "from", oldPath, "to", newPath)
+	}
+	return nil
 }

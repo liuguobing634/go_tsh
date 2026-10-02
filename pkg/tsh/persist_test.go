@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/liuguobing/go_tsh/internal/index"
+	"github.com/liuguobing/go_tsh/internal/tablename"
 )
 
 func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -151,7 +152,7 @@ func TestRepeatedReopenIsIdempotent(t *testing.T) {
 	}
 
 	// 日志大小也不该因为反复重放而增长
-	info, err := os.Stat(filepath.Join(dir, documentsLogName))
+	info, err := os.Stat(filepath.Join(dir, tablesSubdir, tablename.Default+logExt))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +203,7 @@ func TestEmptyDataDirIsPureMemory(t *testing.T) {
 	}
 
 	// 没有任何目录被创建
-	if e.persist != nil {
+	if e.defaultTable().persist != nil {
 		t.Fatal("未指定 DataDir 时不该有持久化状态")
 	}
 	// Close 必须是无害的
@@ -225,7 +226,7 @@ func TestCorruptedLogRefusesToStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	path := filepath.Join(dir, documentsLogName)
+	path := filepath.Join(dir, tablesSubdir, tablename.Default+logExt)
 
 	// 把文件头魔数改掉：模拟"这不是我们的日志文件"
 	raw, err := os.ReadFile(path)
@@ -255,7 +256,7 @@ func TestPersistenceDegradesAndRejectsWrites(t *testing.T) {
 	}
 
 	// 把日志从背后关掉，模拟磁盘/句柄层面的失败。
-	if err := e.persist.log.Close(); err != nil {
+	if err := e.defaultTable().persist.log.Close(); err != nil {
 		t.Fatal(err)
 	}
 

@@ -63,6 +63,23 @@ func toIndexKind(k FieldKind) (index.FieldKind, error) {
 	}
 }
 
+// toPublicKind 是 toIndexKind 的逆运算。
+//
+// 认不出的内部编码一律按 text 报出去，而不是 panic：
+// 这是只读的展示路径，退化成默认值远比让整个进程崩掉合适。
+func toPublicKind(k index.FieldKind) FieldKind {
+	switch k {
+	case index.FieldKeyword:
+		return FieldKeyword
+	case index.FieldNumber:
+		return FieldNumber
+	case index.FieldDate:
+		return FieldDate
+	default:
+		return FieldText
+	}
+}
+
 // DocumentFromValues 从「JSON 原生类型」的字段表构造文档。
 //
 // 这是 HTTP 层的入口，也适合任何手里只有 `map[string]any` 的调用方：
@@ -93,8 +110,8 @@ func DocumentFromValues(id string, values map[string]any) (Document, error) {
 // 字符串，光看值没法知道它该是 date 还是 text。靠猜日期格式是错的：
 // 版本号 "2024-01-01" 会被当成日期，而这是个很难发现的静默错误。
 // 所以日期与关键字字段必须**预先声明**。
-func (e *Engine) ParseDocument(id string, values map[string]any) (Document, error) {
-	schema := e.idx.Schema()
+func (t *Table) ParseDocument(id string, values map[string]any) (Document, error) {
+	schema := t.idx.Schema()
 	return documentFromValues(id, values, func(name string) FieldKind {
 		switch schema[name] {
 		case index.FieldKeyword:
@@ -281,7 +298,7 @@ func (d *Document) putDate(name string, v time.Time) {
 // normalize 把几张字段表合并成索引要的文本形式，并声明各字段的类型。
 //
 // 声明必须发生在写入之前：索引靠 schema 决定这个字段是建倒排还是写数值列。
-func (e *Engine) normalize(doc Document) (map[string]string, error) {
+func (t *Table) normalize(doc Document) (map[string]string, error) {
 	total := len(doc.Fields) + len(doc.Keywords) + len(doc.Numbers) + len(doc.Dates)
 	if total == 0 {
 		return nil, ErrNoFields
@@ -316,7 +333,7 @@ func (e *Engine) normalize(doc Document) (map[string]string, error) {
 		if err := claim(name, "Keywords"); err != nil {
 			return nil, err
 		}
-		if err := e.declareFor(doc.ID, name, index.FieldKeyword); err != nil {
+		if err := t.declareFor(doc.ID, name, index.FieldKeyword); err != nil {
 			return nil, err
 		}
 		fields[name] = v
@@ -326,7 +343,7 @@ func (e *Engine) normalize(doc Document) (map[string]string, error) {
 		if err := claim(name, "Numbers"); err != nil {
 			return nil, err
 		}
-		if err := e.declareFor(doc.ID, name, index.FieldNumber); err != nil {
+		if err := t.declareFor(doc.ID, name, index.FieldNumber); err != nil {
 			return nil, err
 		}
 		// 'g' + -1 是能精确往返的最短表示。
@@ -337,7 +354,7 @@ func (e *Engine) normalize(doc Document) (map[string]string, error) {
 		if err := claim(name, "Dates"); err != nil {
 			return nil, err
 		}
-		if err := e.declareFor(doc.ID, name, index.FieldDate); err != nil {
+		if err := t.declareFor(doc.ID, name, index.FieldDate); err != nil {
 			return nil, err
 		}
 		fields[name] = v.UTC().Format(time.RFC3339Nano)
@@ -347,7 +364,7 @@ func (e *Engine) normalize(doc Document) (map[string]string, error) {
 	// 更重要的是，若某个字段此前被声明成 number，这里会立刻报冲突，
 	// 而不是等到查询时才发现类型对不上。
 	for name := range doc.Fields {
-		if err := e.declareFor(doc.ID, name, index.FieldText); err != nil {
+		if err := t.declareFor(doc.ID, name, index.FieldText); err != nil {
 			return nil, err
 		}
 	}
@@ -359,8 +376,8 @@ func (e *Engine) normalize(doc Document) (map[string]string, error) {
 //
 // 带上文档 ID 很重要：批量导入时「哪个文档触发了类型冲突」是定位问题的
 // 第一手信息，没有它就只能一条条试。
-func (e *Engine) declareFor(docID, field string, kind index.FieldKind) error {
-	if err := e.idx.DeclareField(field, kind); err != nil {
+func (t *Table) declareFor(docID, field string, kind index.FieldKind) error {
+	if err := t.idx.DeclareField(field, kind); err != nil {
 		return fmt.Errorf("文档 %q: %w", docID, err)
 	}
 	return nil

@@ -55,16 +55,16 @@ type Document struct {
 //
 // 启用持久化时，日志追加与索引写入在同一把写锁内完成：返回 nil
 // 表示这次写**已经进入日志**，重启后仍然存在。
-func (e *Engine) Create(doc Document) error {
-	if err := e.persist.check(); err != nil {
+func (t *Table) Create(doc Document) error {
+	if err := t.persist.check(); err != nil {
 		return err
 	}
 
-	fields, err := e.normalize(doc)
+	fields, err := t.normalize(doc)
 	if err != nil {
 		return err
 	}
-	_, err = e.idx.Add(doc.ID, fields)
+	_, err = t.idx.Add(doc.ID, fields)
 	return err
 }
 
@@ -74,27 +74,27 @@ func (e *Engine) Create(doc Document) error {
 // HTTP 层据此决定返回 201 还是 200。
 //
 // 覆盖是**整体替换**：旧版本独有的词条会被完整摘除，不会留下幽灵命中。
-func (e *Engine) Upsert(doc Document) (created bool, err error) {
-	if err := e.persist.check(); err != nil {
+func (t *Table) Upsert(doc Document) (created bool, err error) {
+	if err := t.persist.check(); err != nil {
 		return false, err
 	}
 
-	fields, err := e.normalize(doc)
+	fields, err := t.normalize(doc)
 	if err != nil {
 		return false, err
 	}
-	_, created, err = e.idx.Upsert(doc.ID, fields)
+	_, created, err = t.idx.Upsert(doc.ID, fields)
 	return created, err
 }
 
 // Delete 删除文档。
 //
 // 文档不存在时返回 index.ErrDocumentNotFound。
-func (e *Engine) Delete(id string) error {
-	if err := e.persist.check(); err != nil {
+func (t *Table) Delete(id string) error {
+	if err := t.persist.check(); err != nil {
 		return err
 	}
-	return e.idx.Delete(id)
+	return t.idx.Delete(id)
 }
 
 // GetDocument 取回文档；第二个返回值表示是否存在。
@@ -104,12 +104,12 @@ func (e *Engine) Delete(id string) error {
 // 字段会按 schema **还原成各自的类型**：写进去是数字的，取出来还是数字，
 // 而不是变成字符串 "42"。存进去什么样、取出来什么样，调用方才有
 // 可靠的往返保证。
-func (e *Engine) GetDocument(id string) (Document, bool) {
-	d, ok := e.idx.Get(id)
+func (t *Table) GetDocument(id string) (Document, bool) {
+	d, ok := t.idx.Get(id)
 	if !ok {
 		return Document{}, false
 	}
-	return e.toTypedDocument(d), true
+	return t.toTypedDocument(d), true
 }
 
 // toTypedDocument 按 schema 把内部的文本形式还原成类型化文档。
@@ -117,9 +117,9 @@ func (e *Engine) GetDocument(id string) (Document, bool) {
 // 遇到解析不了的值就**按文本原样给出**，不丢数据：
 // 类型表与内容理论上不会不一致，但真出现时宁可给出原始值，
 // 也不要静默把它变成零值。
-func (e *Engine) toTypedDocument(d *index.Document) Document {
+func (t *Table) toTypedDocument(d *index.Document) Document {
 	doc := Document{ID: d.External}
-	schema := e.idx.Schema()
+	schema := t.idx.Schema()
 
 	for name, raw := range d.Fields {
 		switch schema[name] {
@@ -151,7 +151,17 @@ func (e *Engine) toTypedDocument(d *index.Document) Document {
 //
 // 注意它只列出**建了倒排索引**的字段；数值与时间字段不进倒排，
 // 因此不在这里。完整的字段类型表用 Schema。
-func (e *Engine) Fields() []string { return e.idx.Fields() }
+func (t *Table) Fields() []string { return t.idx.Fields() }
 
-// Schema 返回字段名到类型的映射。
-func (e *Engine) Schema() map[string]index.FieldKind { return e.idx.Schema() }
+// Schema 返回这张表的字段名到类型的映射。
+//
+// 返回的是对外的 FieldKind（字符串形式），不是内部的整数枚举——
+// 调用方不该需要知道内部编码，更不该依赖它。
+func (t *Table) Schema() map[string]FieldKind {
+	internal := t.idx.Schema()
+	out := make(map[string]FieldKind, len(internal))
+	for name, kind := range internal {
+		out[name] = toPublicKind(kind)
+	}
+	return out
+}

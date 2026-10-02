@@ -73,7 +73,7 @@ func BenchmarkUpsertPersistentSyncEach(b *testing.B) {
 		if _, err := e.Upsert(benchDoc(i)); err != nil {
 			b.Fatal(err)
 		}
-		if err := e.persist.log.Sync(); err != nil {
+		if err := e.defaultTable().persist.log.Sync(); err != nil {
 			b.Fatal(err)
 		}
 	}

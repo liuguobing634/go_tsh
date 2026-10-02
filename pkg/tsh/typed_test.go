@@ -49,13 +49,16 @@ func TestDocumentRoundTripByType(t *testing.T) {
 		t.Errorf("Dates = %v, want %v", got.Dates["created"], created)
 	}
 
-	// 类型表也应当被写进去
+	// 类型表也应当被写进去。
+	//
+	// Schema() 返回的是**对外的** FieldKind（字符串），不是内部枚举——
+	// 调用方不该需要知道内部编码。
 	schema := e.Schema()
-	for field, want := range map[string]index.FieldKind{
-		"title":   index.FieldText,
-		"sku":     index.FieldKeyword,
-		"price":   index.FieldNumber,
-		"created": index.FieldDate,
+	for field, want := range map[string]FieldKind{
+		"title":   FieldText,
+		"sku":     FieldKeyword,
+		"price":   FieldNumber,
+		"created": FieldDate,
 	} {
 		if schema[field] != want {
 			t.Errorf("字段 %q 的类型 = %v, want %v", field, schema[field], want)
