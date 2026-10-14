@@ -35,6 +35,9 @@ type searchHitDTO struct {
 //	offset     跳过条数，默认 0
 //	field      限定字段，可重复出现；不传表示全部字段
 //	highlight  是否返回高亮片段，默认 false
+//	sort       排序，如 `price:desc` 或 `created:desc,price:asc`；
+//	           只有 number / date / keyword 字段能排序。
+//	           不传则按相关性分数降序。
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	tb, err := s.tableFor(r)
 	if err != nil {
@@ -68,6 +71,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 排序声明在解析阶段就校验语法；字段名是否存在、类型能不能排，
+	// 要等引擎那边看 schema 才知道，错误同样会映射成 400。
+	sortKeys, err := tsh.ParseSort(params.Get("sort"))
+	if err != nil {
+		s.writeMappedError(w, err)
+		return
+	}
+
 	var fields []string
 	for _, f := range params["field"] {
 		if f = strings.TrimSpace(f); f != "" {
@@ -82,6 +93,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		Limit:     limit,
 		Offset:    offset,
 		Highlight: highlight,
+		Sort:      sortKeys,
 	})
 	if err != nil {
 		s.writeMappedError(w, err)

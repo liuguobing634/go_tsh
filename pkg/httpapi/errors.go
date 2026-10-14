@@ -122,7 +122,14 @@ func (s *Server) writeMappedError(w http.ResponseWriter, err error) {
 
 	case errors.Is(err, query.ErrEmptyQuery),
 		errors.Is(err, query.ErrTooManyClauses),
-		errors.Is(err, query.ErrNilQuery):
+		errors.Is(err, query.ErrNilQuery),
+
+		// 排序声明的错误一律 400：字段名拼错、类型不能排序、键太多，
+		// 全都是调用方能改的。静默忽略一个拼错的 sort，会让用户
+		// 拿到「顺序不对」的结果却不知道为什么。
+		errors.Is(err, query.ErrBadSortField),
+		errors.Is(err, query.ErrUnsortableField),
+		errors.Is(err, query.ErrTooManySortKeys):
 		writeError(w, http.StatusBadRequest, CodeInvalidQuery, err.Error())
 		return
 	}

@@ -40,6 +40,13 @@ type SearchOptions struct {
 
 	// Offset 是跳过的条数。
 	Offset int
+
+	// Sort 是排序键；为空表示按相关性分数降序。
+	//
+	// 传了排序键之后**分数不再决定顺序**，但照常算出来并返回。
+	// 这符合直觉：用户说「按价格排」的时候，相关性只用来筛选，
+	// 不用来决定先后。
+	Sort []SortKey
 }
 
 const (
@@ -86,8 +93,13 @@ func (s *Searcher) Search(n Node, opts SearchOptions) (Result, error) {
 
 	var (
 		hits    hitList
+		values  []sortValue
+		plan    sortPlan
 		evalErr error
+		sortErr error
 	)
+	keep := offset + limit
+
 	s.ix.View(func(v *index.View) {
 		// ⚠️ 这里**不能**因为 fields 为空就提前返回。
 		//
@@ -97,9 +109,23 @@ func (s *Searcher) Search(n Node, opts SearchOptions) (Result, error) {
 		// 也不会报「字段类型不对」，静默给出 0 结果。
 		fields := resolveFields(v, opts.Fields)
 		hits, evalErr = s.eval(v, n, fields)
+		if evalErr != nil || len(opts.Sort) == 0 {
+			return
+		}
+
+		// 排序键的**取值**必须在锁内取（要读数值列与文档原文），
+		// 但比较与排序本身放到锁外——那是 O(n log n)，不该占着读锁。
+		plan, sortErr = planSort(v, opts.Sort)
+		if sortErr != nil {
+			return
+		}
+		values = plan.extract(v, hits.ids)
 	})
 	if evalErr != nil {
 		return Result{}, evalErr
+	}
+	if sortErr != nil {
+		return Result{}, sortErr
 	}
 
 	total := hits.len()
@@ -107,8 +133,23 @@ func (s *Searcher) Search(n Node, opts SearchOptions) (Result, error) {
 		return Result{Total: 0}, nil
 	}
 
+	// 有排序键时走排序路径，否则维持原来的「按分数取 Top-K」。
+	if len(opts.Sort) > 0 {
+		pos := plan.rank(hits.ids, values, keep)
+		if offset >= len(pos) {
+			return Result{Total: total}, nil
+		}
+
+		ranked := make([]Hit, 0, len(pos)-offset)
+		for _, i := range pos[offset:] {
+			id := hits.ids[i]
+			ranked = append(ranked, Hit{ID: id, Score: hits.scores[i]})
+		}
+		return Result{Total: total, Hits: ranked}, nil
+	}
+
 	// 只保留 offset+limit 条：分页不需要对全部命中排序。
-	tk := scoring.NewTopK[index.DocID](offset + limit)
+	tk := scoring.NewTopK[index.DocID](keep)
 	for i, id := range hits.ids {
 		tk.Push(id, hits.scores[i])
 	}

@@ -22,7 +22,28 @@ type SearchRequest struct {
 
 	// Highlight 为 true 时，为每个命中字段生成高亮片段。
 	Highlight bool
+
+	// Sort 指定排序键；为空表示按相关性分数降序。
+	//
+	// 传了它之后，分数**不再决定顺序**（但仍然照常算出来并返回）：
+	// 用户说「按价格排」的时候，相关性只用来筛选。
+	//
+	// 只有 number / date / keyword 字段能排序。text 字段已经分词，
+	// 没有有意义的顺序，传了会返回 query.ErrUnsortableField。
+	Sort []SortKey
 }
+
+// SortKey 是一个排序键。
+//
+// 它是 query.SortKey 的类型别名：既能被外部命名与构造，
+// 又不需要在门面里重复一遍字段再写转换。
+type SortKey = query.SortKey
+
+// ParseSort 解析 `field` 或 `field:desc` 形式的排序声明。
+//
+// 多个键用逗号分隔，靠前的优先：`created:desc,price:asc`。
+// 省略方向时是升序。空的 spec 返回 (nil, nil)。
+func ParseSort(spec string) ([]SortKey, error) { return query.ParseSort(spec) }
 
 // SearchHit 是一条命中结果。
 type SearchHit struct {
@@ -58,6 +79,7 @@ func (t *Table) Search(req SearchRequest) (SearchResult, error) {
 		Fields: req.Fields,
 		Limit:  req.Limit,
 		Offset: req.Offset,
+		Sort:   req.Sort,
 	})
 	if err != nil {
 		return SearchResult{}, err

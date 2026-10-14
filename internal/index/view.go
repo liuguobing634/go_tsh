@@ -94,6 +94,32 @@ func (v *View) NumericRange(field string, lo, hi float64, includeLo, includeHi b
 	return col.rangeScan(lo, hi, includeLo, includeHi, dst), nil
 }
 
+// NumericValue 返回某文档在某数值/时间字段上的值。
+//
+// 第二个返回值为 false 表示该文档在这个字段上没有值。
+//
+// 值按 UTC epoch 毫秒存放的日期字段同样走这里——排序时它们天然可比。
+func (v *View) NumericValue(id DocID, field string) (float64, bool) {
+	col := v.ix.numColumns[field]
+	if col == nil || int(id) >= len(col.values) || !col.present[id] {
+		return 0, false
+	}
+	return col.values[id], true
+}
+
+// FieldValue 返回某文档在某字段上的**原始文本**。
+//
+// **不克隆**：返回的是索引内部持有的那个字符串，写入之后不会再变。
+// 用于排序取键、高亮取原文这类只读场景。要改内容请用 Document（它给副本）。
+func (v *View) FieldValue(id DocID, field string) (string, bool) {
+	doc, ok := v.ix.docs[id]
+	if !ok {
+		return "", false
+	}
+	s, ok := doc.Fields[field]
+	return s, ok
+}
+
 // FieldLens 返回某字段按 DocID 下标的 token 数切片。
 //
 // 返回的是内部切片的**别名**（零拷贝），只在 View 的 fn 执行期间有效。
