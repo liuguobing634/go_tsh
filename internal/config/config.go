@@ -7,6 +7,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -213,14 +214,17 @@ const (
 
 // Load 解析 args（不含程序名）与环境变量，返回校验通过的最终配置。
 //
-// lookup 由调用方注入以便测试；生产环境传 os.Getenv。
-func Load(args []string, lookup func(string) string) (Config, error) {
-	cfg := Default()
+// ErrHelpRequested 表示用户显式请求了用法信息（-h / --help）。
+//
+// 它与「参数写错了」是两回事：前者应当打印用法并以 0 退出，
+// 后者应当报错并以非 0 退出。调用方需要区分，所以单独一个哨兵。
+var ErrHelpRequested = errors.New("请求用法信息")
 
-	fs := flag.NewFlagSet("tshd", flag.ContinueOnError)
-	// flag 默认会把用法信息打到 stderr，这里交由调用方统一处理。
-	fs.SetOutput(io.Discard)
-
+// registerFlags 把全部命令行参数注册到 fs 上。
+//
+// 单独抽出来是为了让 Usage 能打印出**同一份**参数表：
+// 两边各写一遍的话，加了新参数却忘了加进帮助，用户就永远发现不了它。
+func registerFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.HTTP.Addr, "addr", cfg.HTTP.Addr, "HTTP 监听地址")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "日志级别：debug|info|warn|error")
 	fs.StringVar(&cfg.ImportDir, "import", cfg.ImportDir, "启动时导入的语料目录（txt/md）")
@@ -242,8 +246,43 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 	fs.StringVar(&cfg.Mapping, "mapping", cfg.Mapping, `字段类型声明，如 "created:date,sku:keyword"（作用在默认表上）`)
 	fs.StringVar(&cfg.MappingFile, "mapping-file", cfg.MappingFile, "按表声明字段类型的 JSON 文件")
 	fs.StringVar(&cfg.ImportTable, "import-table", cfg.ImportTable, "导入与合成的目标表名，默认为 default")
+}
+
+// Usage 把全部命令行参数的说明写到 w。
+//
+// 由调用方决定什么时候打：正常启动不打，-h 与参数写错时才打。
+//
+// 之前这里没有这个函数，而 Load 又把 flag 的输出丢掉了（SetOutput(io.Discard)），
+// 结果是 `tshd -h` 只回一句「flag: help requested」，
+// 参数写错时也只回一句错误——二十多个参数用户无从发现。
+func Usage(w io.Writer) {
+	cfg := Default()
+	fs := flag.NewFlagSet("tshd", flag.ContinueOnError)
+	fs.SetOutput(w)
+	registerFlags(fs, &cfg)
+
+	fmt.Fprintln(w, "用法: tshd [参数]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "每个参数都可用环境变量覆盖：加 TSH_ 前缀、中划线转下划线并大写，")
+	fmt.Fprintln(w, "例如 -query-timeout 对应 TSH_QUERY_TIMEOUT。命令行优先于环境变量。")
+	fmt.Fprintln(w)
+	fs.PrintDefaults()
+}
+
+// lookup 由调用方注入以便测试；生产环境传 os.Getenv。
+func Load(args []string, lookup func(string) string) (Config, error) {
+	cfg := Default()
+
+	fs := flag.NewFlagSet("tshd", flag.ContinueOnError)
+	// flag 自己打出来的用法信息不带我们的上下文，也没法走调用方的
+	// 输出通道，所以丢弃它、由 Usage 统一提供。
+	fs.SetOutput(io.Discard)
+	registerFlags(fs, &cfg)
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return Config{}, ErrHelpRequested
+		}
 		return Config{}, fmt.Errorf("解析命令行参数: %w", err)
 	}
 

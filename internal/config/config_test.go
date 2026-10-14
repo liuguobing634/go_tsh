@@ -1,8 +1,13 @@
 package config
 
 import (
+	"bytes"
+	"errors"
+	"flag"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -399,5 +404,60 @@ func TestImportTableConfig(t *testing.T) {
 	// 非法表名必须在启动时就报错
 	if _, err := Load([]string{"-import-table", "Products"}, mapEnv(nil)); err == nil {
 		t.Error("非法的 import-table 应当让启动失败")
+	}
+}
+
+func TestUsageListsAllFlags(t *testing.T) {
+	var buf bytes.Buffer
+	Usage(&buf)
+	out := buf.String()
+
+	// Usage 打印的必须是**真实注册的参数**，而不是另一份手写的清单。
+	// 所以这里跟 registerFlags 走一遍，逐个比对。
+	cfg := Default()
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registerFlags(fs, &cfg)
+
+	count := 0
+	fs.VisitAll(func(f *flag.Flag) {
+		count++
+		if !strings.Contains(out, "-"+f.Name) {
+			t.Errorf("参数 -%s 没有出现在 Usage 里", f.Name)
+		}
+	})
+
+	if count == 0 {
+		t.Fatal("没有注册任何参数？")
+	}
+	// 注册数与打印数要一致，否则说明有一边漏了
+	if printed := strings.Count(out, "\n  -"); printed != count {
+		t.Errorf("Usage 里打印了 %d 个参数，实际注册了 %d 个", printed, count)
+	}
+	// 环境变量说明也要有——否则用户不知道 TSH_ 覆盖机制
+	if !strings.Contains(out, "TSH_") {
+		t.Error("Usage 里应当说明环境变量覆盖规则")
+	}
+}
+
+// -h / --help 必须是**可区分的**错误：调用方要据此以 0 退出并打用法，
+// 而不是当成「参数写错了」报错。
+func TestHelpIsDistinguishableFromBadArgs(t *testing.T) {
+	for _, arg := range []string{"-h", "--help", "-help"} {
+		_, err := Load([]string{arg}, mapEnv(nil))
+		if !errors.Is(err, ErrHelpRequested) {
+			t.Errorf("Load(%q) 应当返回 ErrHelpRequested，实际: %v", arg, err)
+		}
+	}
+
+	_, err := Load([]string{"-no-such-flag"}, mapEnv(nil))
+	if err == nil {
+		t.Fatal("未知参数应当报错")
+	}
+	if errors.Is(err, ErrHelpRequested) {
+		t.Error("未知参数不该被当成 help 请求")
+	}
+	if !strings.Contains(err.Error(), "no-such-flag") {
+		t.Errorf("错误里应当点出是哪个参数：%v", err)
 	}
 }

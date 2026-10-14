@@ -44,8 +44,17 @@ func main() {
 func run(args []string) int {
 	cfg, err := config.Load(args, os.Getenv)
 	if err != nil {
+		// -h / --help 是正常请求，不是错误：打用法、以 0 退出。
+		if errors.Is(err, config.ErrHelpRequested) {
+			config.Usage(os.Stdout)
+			return 0
+		}
+
 		// 此刻日志系统尚未建立，只能直接写 stderr。
-		fmt.Fprintf(os.Stderr, "tshd: 配置错误: %v\n", err)
+		fmt.Fprintf(os.Stderr, "tshd: 配置错误: %v\n\n", err)
+		// 参数写错时把可选参数一并列出来——二十多个参数如果只回一句
+		// 「flag provided but not defined」，用户只能去翻源码。
+		config.Usage(os.Stderr)
 		return 2
 	}
 
