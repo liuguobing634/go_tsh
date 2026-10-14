@@ -15,11 +15,18 @@ import (
 	"time"
 
 	"github.com/liuguobing/go_tsh/internal/tablename"
+	"github.com/liuguobing/go_tsh/pkg/httpapi"
 )
 
 // Config 汇总服务的全部可调参数。
 type Config struct {
-	Addr     string // HTTP 监听地址
+	// HTTP 是 HTTP 层的配置。
+	//
+	// 它直接就是 pkg/httpapi 的 Options，而不是这里再抄一份字段——
+	// 两边各定义一遍默认值，迟早会漂移，而症状是「命令行改了没生效」
+	// 这种很难查的问题。
+	HTTP httpapi.Options
+
 	LogLevel string // debug | info | warn | error
 
 	// ImportDir 是启动时导入的语料目录；为空表示不导入。
@@ -33,14 +40,10 @@ type Config struct {
 	// 一个开关就能得到可复现、且词频不均匀的语料。
 	GenerateDocs int
 
-	MaxBodyBytes  int64         // 单请求体字节上限
 	MaxDocFields  int           // 单文档字段数上限
 	MaxDocTokens  int           // 单文档 token 数上限
 	MaxQueryTerms int           // 单次查询 term 数上限
 	QueryTimeout  time.Duration // 单次查询超时
-	ReadTimeout   time.Duration // HTTP 读超时
-	WriteTimeout  time.Duration // HTTP 写超时
-	IdleTimeout   time.Duration // HTTP 空闲连接超时
 	ShutdownGrace time.Duration // 优雅关闭等待上限
 
 	// Analyzer 选择文本分析器："standard"（默认，英文/数字）或 "chinese"
@@ -188,16 +191,14 @@ func ParseMappingFile(path string) (map[string]map[string]string, error) {
 // Default 返回一套可直接用于本地开发的默认配置。
 func Default() Config {
 	return Config{
-		Addr:          ":8080",
+		// HTTP 的默认值只有一处定义：pkg/httpapi。
+		// 这里再抄一遍 = 两份默认值迟早漂移。
+		HTTP:          httpapi.DefaultOptions(),
 		LogLevel:      "info",
-		MaxBodyBytes:  8 << 20, // 8 MiB
 		MaxDocFields:  32,
 		MaxDocTokens:  100_000,
 		MaxQueryTerms: 32,
 		QueryTimeout:  5 * time.Second,
-		ReadTimeout:   10 * time.Second,
-		WriteTimeout:  30 * time.Second,
-		IdleTimeout:   60 * time.Second,
 		ShutdownGrace: 10 * time.Second,
 		Analyzer:      AnalyzerStandard,
 		SyncInterval:  100 * time.Millisecond,
@@ -220,18 +221,18 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 	// flag 默认会把用法信息打到 stderr，这里交由调用方统一处理。
 	fs.SetOutput(io.Discard)
 
-	fs.StringVar(&cfg.Addr, "addr", cfg.Addr, "HTTP 监听地址")
+	fs.StringVar(&cfg.HTTP.Addr, "addr", cfg.HTTP.Addr, "HTTP 监听地址")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "日志级别：debug|info|warn|error")
 	fs.StringVar(&cfg.ImportDir, "import", cfg.ImportDir, "启动时导入的语料目录（txt/md）")
 	fs.IntVar(&cfg.GenerateDocs, "generate", cfg.GenerateDocs, "启动时合成的文档数（压测用）")
-	fs.Int64Var(&cfg.MaxBodyBytes, "max-body-bytes", cfg.MaxBodyBytes, "单请求体字节上限")
+	fs.Int64Var(&cfg.HTTP.MaxBodyBytes, "max-body-bytes", cfg.HTTP.MaxBodyBytes, "单请求体字节上限")
 	fs.IntVar(&cfg.MaxDocFields, "max-doc-fields", cfg.MaxDocFields, "单文档字段数上限")
 	fs.IntVar(&cfg.MaxDocTokens, "max-doc-tokens", cfg.MaxDocTokens, "单文档 token 数上限")
 	fs.IntVar(&cfg.MaxQueryTerms, "max-query-terms", cfg.MaxQueryTerms, "单次查询 term 数上限")
 	fs.DurationVar(&cfg.QueryTimeout, "query-timeout", cfg.QueryTimeout, "单次查询超时")
-	fs.DurationVar(&cfg.ReadTimeout, "read-timeout", cfg.ReadTimeout, "HTTP 读超时")
-	fs.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "HTTP 写超时")
-	fs.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "HTTP 空闲连接超时")
+	fs.DurationVar(&cfg.HTTP.ReadTimeout, "read-timeout", cfg.HTTP.ReadTimeout, "HTTP 读超时")
+	fs.DurationVar(&cfg.HTTP.WriteTimeout, "write-timeout", cfg.HTTP.WriteTimeout, "HTTP 写超时")
+	fs.DurationVar(&cfg.HTTP.IdleTimeout, "idle-timeout", cfg.HTTP.IdleTimeout, "HTTP 空闲连接超时")
 	fs.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace, "优雅关闭等待上限")
 	fs.StringVar(&cfg.Analyzer, "analyzer", cfg.Analyzer, "文本分析器：standard|chinese")
 	fs.StringVar(&cfg.DictPath, "dict", cfg.DictPath, "中文自定义词典文件（每行一个词）")
@@ -287,8 +288,11 @@ func (c Config) Validate() error {
 		return fmt.Errorf("非法的 log-level %q，可选 debug|info|warn|error", c.LogLevel)
 	}
 
-	if strings.TrimSpace(c.Addr) == "" {
-		return fmt.Errorf("addr 不能为空")
+	// HTTP 层自己知道自己需要什么（监听地址、超时、请求体上限），
+	// 交给它校验比在这里重复一遍字段检查更不容易漏。
+	// 这里只负责把错误加上「是哪个配置项」的上下文。
+	if err := c.HTTP.Validate(); err != nil {
+		return err
 	}
 
 	switch c.Analyzer {
@@ -315,7 +319,6 @@ func (c Config) Validate() error {
 		name string
 		val  int64
 	}{
-		{"max-body-bytes", c.MaxBodyBytes},
 		{"max-doc-fields", int64(c.MaxDocFields)},
 		{"max-doc-tokens", int64(c.MaxDocTokens)},
 		{"max-query-terms", int64(c.MaxQueryTerms)},
@@ -356,9 +359,7 @@ func (c Config) Validate() error {
 		val  time.Duration
 	}{
 		{"query-timeout", c.QueryTimeout},
-		{"read-timeout", c.ReadTimeout},
-		{"write-timeout", c.WriteTimeout},
-		{"idle-timeout", c.IdleTimeout},
+		// read/write/idle-timeout 由 httpapi.Options.Validate 校验。
 		{"shutdown-grace", c.ShutdownGrace},
 	}
 	for _, d := range positiveDurations {

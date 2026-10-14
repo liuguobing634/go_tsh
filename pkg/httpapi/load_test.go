@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liuguobing/go_tsh/internal/config"
 	"github.com/liuguobing/go_tsh/internal/corpus"
 	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
@@ -46,7 +45,7 @@ func loadServer(b *testing.B) *httptest.Server {
 		b.Logf("语料构建完成：%d 篇 / %d 个词条 / 索引约 %.1f MB / 耗时 %s",
 			st.Docs, st.Terms, float64(st.IndexBytes)/(1<<20), time.Since(start).Round(time.Millisecond))
 
-		srv := New(config.Default(), engine, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		srv := New(DefaultOptions(), engine, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		// Server 内嵌的是 *http.Server，它本身没有 ServeHTTP；
 		// 路由与中间件都挂在 Handler 字段上。
 		loadSrv = httptest.NewServer(srv.Handler)

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/liuguobing/go_tsh/internal/config"
 	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
 
@@ -74,7 +73,7 @@ func hitIDs(res searchResponse) []string {
 }
 
 // newServerWithConfig 用指定配置构造测试服务器。
-func newServerWithConfig(t *testing.T, cfg config.Config) *Server {
+func newServerWithConfig(t *testing.T, cfg Options) *Server {
 	t.Helper()
 	return New(cfg, tsh.New(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
@@ -424,7 +423,7 @@ func mustJSON(t *testing.T, v any) string {
 // ---------------------------------------------------------------- 请求体上限
 
 func TestRequestBodyTooLarge(t *testing.T) {
-	cfg := config.Default()
+	cfg := DefaultOptions()
 	cfg.MaxBodyBytes = 64
 	srv := newServerWithConfig(t, cfg)
 

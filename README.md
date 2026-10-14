@@ -431,19 +431,59 @@ make check
 ```
 cmd/tshd/           # 守护进程入口：配置装配、语料导入、日志、优雅关闭
 internal/config/    # 配置解析（flag + env）
-internal/httpapi/   # HTTP 路由、中间件、DTO、错误映射 ✅ 全部端点
 internal/analyzer/  # 文本分析 ✅ StandardAnalyzer + 内置停用词表
 internal/index/     # 倒排索引 ✅ InvertedIndex + View / PostingCursor
 internal/query/     # 查询 AST、解析器与执行器（归并求值 + BM25）✅
 internal/scoring/   # BM25 与 Top-K ✅
 internal/highlight/ # 高亮片段（HTML 转义 + 窗口截断）✅
 internal/corpus/    # 语料导入与合成（演示 / 压测用）✅
-pkg/tsh/            # 对外门面 Engine ✅ 文档读写 + 检索
+internal/tablename/ # 表名校验（四个调用方共用一条规则）✅
+pkg/tsh/            # 对外门面 Engine ✅ 可被别的 Go 程序嵌入
+pkg/httpapi/        # HTTP 路由、中间件、DTO、错误映射 ✅ 可挂进调用方进程
+apicheck/           # 跨 module 的对外 API 编译门禁
 deploy/             # Dockerfile（多阶段 → scratch）
 docs/               # 性能报告
 ```
 
-依赖方向单向向内：`httpapi → tsh → {analyzer, query, index, scoring}`。
+依赖方向单向向内：
+`cmd/tshd → pkg/httpapi → pkg/tsh → {analyzer, query, index, scoring}`。
+
+### 作为库嵌入
+
+`pkg/tsh` 可以直接跑在你自己的进程里，不需要额外部署服务：
+
+```go
+engine, err := tsh.NewWith(tsh.Options{
+    Analyzer: tsh.AnalyzerChinese,
+    DataDir:  "./data",          // 留空则纯内存
+})
+defer engine.Close()
+
+engine.Upsert(tsh.Document{
+    ID:     "p1",
+    Fields: map[string]string{"name": "笔记本电脑"},
+    Numbers: map[string]float64{"price": 4999},
+})
+
+res, _ := engine.Search(tsh.SearchRequest{Query: "name:笔记本", Limit: 10})
+```
+
+想同时提供 HTTP 接口，又不想被接管整个 Server：
+
+```go
+api := httpapi.New(httpapi.DefaultOptions(), engine, logger)
+
+mux := http.NewServeMux()
+api.Register(mux)                        // 路由进自己的 mux
+mux.HandleFunc("GET /my/custom", myHandler)
+http.ListenAndServe(":8080", api.Wrap(mux))  // 中间件套在最外层
+```
+
+`apicheck/` 是一个**跨 module** 的编译门禁：它用 `replace` 指回本仓库，
+因此受和真实用户完全相同的 `internal` 规则约束。
+仓库内的测试测不到这件事——`package tsh_test` 虽然在别的包里，
+但仍在同一个 module 内，照样能 import `internal`。
+「外部用户拿不到这个类型」只有跨 module 才暴露得出来。
 
 ## 故障排查
 

@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/liuguobing/go_tsh/internal/config"
 	"github.com/liuguobing/go_tsh/pkg/tsh"
 	"io"
 	"log/slog"
@@ -23,7 +22,7 @@ func newTypedServer(t *testing.T, schema map[string]tsh.FieldKind) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(config.Default(), engine, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(DefaultOptions(), engine, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // putDoc 写入一篇文档，返回响应记录器。

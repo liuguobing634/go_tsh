@@ -89,7 +89,7 @@
 
 ```
                     ┌─────────────────────────────────────┐
-   HTTP 请求  ───▶  │  internal/httpapi                    │
+   HTTP 请求  ───▶  │  pkg/httpapi                        │
                     │  handler / 中间件 / 参数校验 / 错误映射 │
                     └───────────────┬─────────────────────┘
                                     │
@@ -1716,19 +1716,39 @@ module 内**，照样能 import `internal`。「外部用户拿不到这个类�
 
 **仍然阻塞**：
 
-- [ ] **HTTP 层整个在 `internal/` 里**（连它依赖的 `internal/config` 也在），
+- [x] **HTTP 层整个在 `internal/` 里**（连它依赖的 `internal/config` 也在），
       外部**挂不进自己的进程**。实测报错：
       `use of internal package .../internal/config not allowed`。
       这一条直接挡住「保留对外 API」的需求。
 
-  方案：
-  - `internal/httpapi` → `pkg/httpapi`
-  - 给它自己的 `Options`（服务器相关的子集），**不依赖 `internal/config`**——
-    库不该知道什么是命令行参数。`internal/config` 继续负责 flag/env，
-    在 `cmd/tshd` 里映射成 `httpapi.Options`。
-  - 提供 `Register(mux)` 而不只是 `Handler()`：嵌入方通常要挂到**自己的**
-    路由上，和自己的中间件、路由共存，而不是被接管整个 Server。
-  - 验收：把 `apicheck/main.go` 末尾那段注释打开，门禁仍然全绿。
+  已按下面的方案完成：
+
+  - `internal/httpapi` → **`pkg/httpapi`**
+  - **自己的 `Options`**（服务器相关的子集），不依赖 `internal/config`——
+    库不该知道什么是命令行参数
+  - `Register(mux)` 挂到调用方自己的路由上，`Wrap(handler)` 套中间件，
+    `New` 返回的 Server 自带套好的 Handler 供独立部署
+  - 验收：`apicheck/main.go` 里挂载 HTTP 的那段已打开，门禁全绿；
+    另加了 `pkg/httpapi/embed_test.go` 做**功能性**验证
+    （编译门禁只能证明类型够用，证明不了挂上去能工作）
+
+#### 12.1.1 顺带发现：`-query-timeout` 是个死旋钮
+
+在 `internal/config` 里定义、有默认值、有 flag、有校验，但**全仓库没有
+任何地方使用它**——用户设了它不会有任何效果。
+
+留在原处没动，因为真正实现它需要把 `context` 一路传进求值器
+（`View` 拿的是读锁，光靠 goroutine + select 只能让 HTTP 提前返回，
+后台那个查询仍在跑并持着读锁，高并发下会积累）。
+
+两条路，需要选一条：
+
+- **实现**：给 `query.Searcher` 的求值循环加 `ctx` 检查，真正可中断；
+- **移除**：删掉 flag 与字段。
+
+倾向**实现**——「查询超时」对一个要嵌进别人进程的库来说是合理诉求，
+而且它正好是 `pkg/httpapi.Options` 该管的事（请求级超时）。
+但在做之前，先确认这不是当初从别处抄配置时带进来的残留。
 
 #### 12.2 P0：压实（不做会自己烂）
 

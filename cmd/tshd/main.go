@@ -29,7 +29,7 @@ import (
 	"syscall"
 
 	"github.com/liuguobing/go_tsh/internal/config"
-	"github.com/liuguobing/go_tsh/internal/httpapi"
+	"github.com/liuguobing/go_tsh/pkg/httpapi"
 )
 
 // version 由 -ldflags "-X main.version=..." 在构建时注入。
@@ -84,7 +84,7 @@ func run(args []string) int {
 		return 1
 	}
 
-	srv := httpapi.New(cfg, engine, logger)
+	srv := httpapi.New(cfg.HTTP, engine, logger)
 
 	// 收到 Ctrl+C（Windows/Linux）或 SIGTERM（Linux）时取消 ctx。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -92,7 +92,7 @@ func run(args []string) int {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("服务启动", "addr", cfg.Addr, "version", version)
+		logger.Info("服务启动", "addr", cfg.HTTP.Addr, "version", version)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}

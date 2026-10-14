@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/liuguobing/go_tsh/internal/config"
 	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
 
@@ -16,7 +15,7 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	return New(
-		config.Default(),
+		DefaultOptions(),
 		tsh.New(),
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
@@ -83,7 +82,7 @@ func TestWrongMethodReturns405(t *testing.T) {
 }
 
 func TestNilEngineFallsBackToEmpty(t *testing.T) {
-	srv := New(config.Default(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := New(DefaultOptions(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if rec := do(t, srv, http.MethodGet, "/api/v1/stats", nil); rec.Code != http.StatusOK {
 		t.Fatalf("传入 nil 引擎时不应 panic，状态码 = %d", rec.Code)
 	}
@@ -91,7 +90,7 @@ func TestNilEngineFallsBackToEmpty(t *testing.T) {
 
 func TestRecoverMiddlewareReturns500(t *testing.T) {
 	srv := New(
-		config.Default(),
+		DefaultOptions(),
 		tsh.New(),
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)

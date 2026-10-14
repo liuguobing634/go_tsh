@@ -26,17 +26,21 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"time"
 
+	"github.com/liuguobing/go_tsh/pkg/httpapi"
 	"github.com/liuguobing/go_tsh/pkg/tsh"
 )
 
 func main() {
 	// ---- 1. 拿一份默认值再改：新用户最需要的入口 ----
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
 	opts := tsh.DefaultOptions()
 	opts.Analyzer = tsh.AnalyzerChinese
-	opts.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	opts.Logger = logger
 
 	// ---- 2. 复合字面量必须写得出来（类型名要能被外部命名）----
 	opts2 := tsh.Options{
@@ -122,20 +126,32 @@ func main() {
 	_, err = engine.Table("nope")
 	fmt.Println("表不存在可判定:", err == tsh.ErrTableNotFound)
 
-	// ------------------------------------------------------------------
-	// TODO(Phase 12)：外部仍然挂不上 HTTP 接口。
+	// ---- 11. 把 HTTP 接口挂进**自己的**进程 ----
 	//
-	// 下面这段**故意保持注释**——它现在编译不过，因为 HTTP 层在
-	// internal/ 里（连它依赖的 config 也在）。等把它挪到 pkg/httpapi
-	// 之后，这里要打开，作为「保留对外 API」这条需求的验收点。
+	// 这是「保留对外 API，方便后面独立部署」这条需求的验收点。
+	// 此前 HTTP 层在 internal/ 里，外部根本 import 不了。
+	api := httpapi.New(httpapi.Options{
+		Addr:         "127.0.0.1:0",
+		MaxBodyBytes: 8 << 20,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}, engine, logger)
+
+	// 两种挂法。这里演示的是「挂到自己的 mux 上」——
+	// 嵌入方通常要和自己的路由、自己的中间件共存，而不是被接管整个 Server。
+	mux := http.NewServeMux()
+	api.Register(mux)
+	mux.HandleFunc("GET /my/custom", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// 中间件要的话自己套一层；不要就直接用 mux。
+	_ = api.Wrap(mux)
+
+	// 只想单独跑一个搜索服务时，New 返回的 Server 本身就能用：
+	//	if err := api.ListenAndServe(); err != nil { ... }
 	//
-	//	api := httpapi.New(httpapi.Options{
-	//		MaxBodyBytes: 8 << 20,
-	//		MaxDocFields: 32,
-	//	}, engine, logger)
-	//
-	//	mux := http.NewServeMux()
-	//	api.Register(mux)          // 挂到调用方自己的路由上
-	//	http.ListenAndServe(":0", mux)
-	// ------------------------------------------------------------------
+	// 而且不用把整个 Server 交给它——可以只借它的 Handler：
+	_ = api.Handler
 }

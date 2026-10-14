@@ -64,7 +64,7 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 func (s *Server) withBodyLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil {
-			r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
+			r.Body = http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
 		}
 		next.ServeHTTP(w, r)
 	})

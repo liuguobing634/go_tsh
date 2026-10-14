@@ -48,7 +48,7 @@ func TestLoadEnvOverridesDefault(t *testing.T) {
 		got  any
 		want any
 	}{
-		{"Addr", cfg.Addr, ":9999"},
+		{"Addr", cfg.HTTP.Addr, ":9999"},
 		{"LogLevel", cfg.LogLevel, "debug"},
 		{"MaxQueryTerms", cfg.MaxQueryTerms, 8},
 		{"QueryTimeout", cfg.QueryTimeout, 1500 * time.Millisecond},
@@ -69,8 +69,8 @@ func TestLoadFlagBeatsEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load 返回错误: %v", err)
 	}
-	if cfg.Addr != ":7777" {
-		t.Fatalf("命令行显式指定的值应优先于环境变量，Addr = %q, want %q", cfg.Addr, ":7777")
+	if cfg.HTTP.Addr != ":7777" {
+		t.Fatalf("命令行显式指定的值应优先于环境变量，Addr = %q, want %q", cfg.HTTP.Addr, ":7777")
 	}
 }
 

@@ -209,10 +209,10 @@ $env:GOCACHE = "$PWD\.gocache"
 $go = "D:\Program Files\Go\bin\go.exe"
 
 # 单连接延迟（含 P95/P99/最大值，原始分位数见 -v 日志）
-& $go test -run '^$' -bench 'BenchmarkHTTPGet' -benchmem -benchtime 2000x -v ./internal/httpapi
+& $go test -run '^$' -bench 'BenchmarkHTTPGet' -benchmem -benchtime 2000x -v ./pkg/httpapi
 
 # 并发吞吐
-& $go test -run '^$' -bench 'BenchmarkHTTPParallel' -benchmem -benchtime 3s ./internal/httpapi
+& $go test -run '^$' -bench 'BenchmarkHTTPParallel' -benchmem -benchtime 3s ./pkg/httpapi
 
 # 纯引擎层（不含 HTTP）
 & $go test -run '^$' -bench 'BenchmarkSearch100k' -benchmem ./internal/query
