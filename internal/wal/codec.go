@@ -160,14 +160,15 @@ type Document struct {
 //   - 2 及更高：每个字段前有一个类型字节
 //   - 1：只有「名字 + 值」，全部按 text 处理
 //
-// **按「布局世代」而不是「精确版本」判断**：v3 只是多了一种记录类型，
+// **按「布局世代」而不是「精确版本」判断**：v3、v4 都只是多了记录类型，
 // upsert 的布局与 v2 完全一样。写成 `case 1, 2` 会在升级到 v3 的那一刻
 // 让所有文档重放集体失败——而空表（只有 declare 记录）测不出来，
 // 这个坑真的踩过一次。
+//
+// 版本区间用 FormatVersion 而不是硬编码列表：每加一种记录类型都要回来
+// 改这个开关，迟早会漏。文件头那关（Open）已经把超出区间的文件挡住了。
 func DecodeUpsert(version uint8, payload []byte) (Document, error) {
-	switch version {
-	case 1, 2, 3:
-	default:
+	if version < 1 || version > FormatVersion {
 		return Document{}, fmt.Errorf("%w: 不支持的重放版本 %d", errMalformed, version)
 	}
 	// v1 是唯一没有类型字节的世代。
@@ -252,4 +253,85 @@ func DecodeDelete(payload []byte) (string, error) {
 			errMalformed, len(payload)-off)
 	}
 	return external, nil
+}
+
+// ImportRecord 是一条 import-done 记录的内容。
+//
+// Generate 也记下来是为了能发现「启动参数变了」：用户从
+// `-import a/` 换成 `-import b/` 时，如果只看「有没有标记」，
+// 就会静默地什么都不导入——那是很难自己发现的一类意外。
+type ImportRecord struct {
+	// Dir 是导入的语料目录；只有 -generate 时为空。
+	Dir string
+
+	// Files 与 Bytes 是当时导入的规模，只给人看。
+	Files int
+	Bytes int64
+
+	// Generate 是当时 -generate 指定的篇数。
+	Generate int
+}
+
+// EncodeImportDone 把一次「语料导入已完成」编码成 import-done 记录的 payload。
+func EncodeImportDone(rec ImportRecord, dst []byte) []byte {
+	dst = appendString(dst, rec.Dir)
+	dst = binary.AppendUvarint(dst, uint64(rec.Files))
+	dst = binary.AppendUvarint(dst, uint64(rec.Bytes))
+	dst = binary.AppendUvarint(dst, uint64(rec.Generate))
+	return dst
+}
+
+// DecodeImportDone 解析 import-done 记录的 payload。
+func DecodeImportDone(payload []byte) (ImportRecord, error) {
+	var rec ImportRecord
+
+	dir, off, err := readString(payload, 0)
+	if err != nil {
+		return rec, err
+	}
+	rec.Dir = dir
+
+	// Dir 为空是合法的：只用了 -generate 时就没有目录。
+	// 但「目录和生成篇数都为空」说明这条记录没有意义。
+	nums := make([]uint64, 0, 3)
+	for range 3 {
+		v, m := binary.Uvarint(payload[off:])
+		if m <= 0 {
+			return ImportRecord{}, errMalformed
+		}
+		off += m
+		nums = append(nums, v)
+	}
+
+	if off != len(payload) {
+		return ImportRecord{}, fmt.Errorf("%w: import-done 记录尾部多了 %d 字节",
+			errMalformed, len(payload)-off)
+	}
+	if rec.Dir == "" && nums[2] == 0 {
+		return ImportRecord{}, fmt.Errorf("%w: import-done 记录既没有目录也没有生成篇数",
+			errMalformed)
+	}
+
+	// 饱和转换：这几个数只用于展示，但直接 int() 溢出后会变成负数，
+	// 日志里就会出现「导入了 -1 个文件」这种莫名其妙的话。
+	rec.Files = saturateInt(nums[0])
+	rec.Bytes = saturateInt64(nums[1])
+	rec.Generate = saturateInt(nums[2])
+	return rec, nil
+}
+
+func saturateInt(v uint64) int {
+	maxInt := uint64(^uint(0) >> 1)
+	if v > maxInt {
+		return int(maxInt)
+	}
+	return int(v)
+}
+
+func saturateInt64(v uint64) int64 {
+	maxInt := uint64(^uint64(0) >> 1)
+	if v > maxInt {
+		return int64(maxInt)
+	}
+	return int64(v)
 }

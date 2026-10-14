@@ -114,9 +114,24 @@ func TestDecodeLegacyV1Upsert(t *testing.T) {
 func TestDecodeUpsertRejectsUnknownVersion(t *testing.T) {
 	payload := EncodeUpsert("doc", map[string]string{"a": "b"}, nil, nil)
 
-	for _, v := range []uint8{0, 4, 99} {
+	// 从 FormatVersion 推导而不是硬编码：每加一种记录类型都会升版本，
+	// 写死列表的话这个测试每次都得改——而「测试要跟着改」很容易
+	// 演变成「顺手把断言也改了」。
+	for _, v := range []uint8{0, FormatVersion + 1, 99} {
 		if _, err := DecodeUpsert(v, payload); !errors.Is(err, errMalformed) {
 			t.Errorf("版本 %d 应当被拒绝，实际: %v", v, err)
+		}
+	}
+
+	// 反过来：凡是**布局与当前一致**的版本，同一份 payload 都必须能解码。
+	//
+	// 从 v2 起（v1 没有类型字节，是另一个布局世代，由
+	// TestDecodeLegacyV1Upsert 单独守着）。
+	// 这条挡住「Open 接受、DecodeUpsert 拒绝」这种不一致——
+	// 它的后果是「日志能打开，但所有文档都读不回来」。
+	for v := uint8(2); v <= FormatVersion; v++ {
+		if _, err := DecodeUpsert(v, payload); err != nil {
+			t.Errorf("版本 %d 的 upsert 布局与当前一致，不该被拒绝: %v", v, err)
 		}
 	}
 }
@@ -330,5 +345,68 @@ func TestV2LogRemainsReadable(t *testing.T) {
 
 	if got := log.Version(); got != 2 {
 		t.Errorf("读到的版本 = %d, want 2（解码方必须按日志自身的版本，而不是编译期常量）", got)
+	}
+}
+
+func TestImportDoneCodecRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  ImportRecord
+	}{
+		{"带目录", ImportRecord{Dir: "/data/corpus", Files: 12, Bytes: 3456}},
+		{"只有目录", ImportRecord{Dir: "corpus"}},
+		{"只有 generate", ImportRecord{Generate: 1000}},
+		{"目录与 generate 都有", ImportRecord{Dir: "d", Files: 1, Bytes: 2, Generate: 3}},
+		{"非 ASCII 目录", ImportRecord{Dir: "C:\\语料\\中文", Files: 2}},
+		{"很大的数字", ImportRecord{Dir: "d", Files: 1 << 30, Bytes: 1 << 40, Generate: 1 << 20}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DecodeImportDone(EncodeImportDone(tc.rec, nil))
+			if err != nil {
+				t.Fatalf("解析失败: %v", err)
+			}
+			if got != tc.rec {
+				t.Errorf("往返后 = %+v, want %+v", got, tc.rec)
+			}
+		})
+	}
+}
+
+func TestDecodeImportDoneRejectsMalformed(t *testing.T) {
+	valid := EncodeImportDone(ImportRecord{Dir: "d", Files: 1, Bytes: 2, Generate: 3}, nil)
+
+	cases := []struct {
+		name    string
+		payload []byte
+	}{
+		{"空 payload", nil},
+		{"截断", valid[:len(valid)-1]},
+		{"尾部多余字节", append(append([]byte{}, valid...), 0x00)},
+		// 既没有目录也没有生成篇数 = 这条记录没有意义
+		{"目录与 generate 都为空", EncodeImportDone(ImportRecord{}, nil)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeImportDone(tc.payload); !errors.Is(err, errMalformed) {
+				t.Errorf("应当返回 errMalformed，实际: %v", err)
+			}
+		})
+	}
+}
+
+// KindImportDone 必须被认作已知类型，否则扫描会把它当成文件尾部截断——
+// 而它后面很可能还有文档记录。
+func TestKindImportDoneIsKnown(t *testing.T) {
+	if !isKnownKind(KindImportDone) {
+		t.Error("KindImportDone 必须被认作已知类型")
+	}
+	if KindImportDone.String() != "import-done" {
+		t.Errorf("String() = %q", KindImportDone.String())
+	}
+	if KindImportDone == KindUpsert || KindImportDone == KindDelete || KindImportDone == KindDeclare {
+		t.Error("记录类型的取值不能重复")
 	}
 }

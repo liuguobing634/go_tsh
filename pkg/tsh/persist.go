@@ -70,6 +70,11 @@ type persistState struct {
 	// compacting 保证同一时刻只有一次压实。
 	compacting atomic.Bool
 
+	// imported 是日志里最后一次「导入已完成」标记；没有则为 nil。
+	//
+	// 它只在重放时写入、在 MarkImported 时更新，因此用原子指针即可。
+	imported atomic.Pointer[ImportMarker]
+
 	// scratch 是编码 payload 的复用缓冲。
 	//
 	// 不需要加锁：钩子由索引在**写锁内**调用，同一时刻只有一个调用者。
@@ -139,6 +144,85 @@ func (p *persistState) apply(c index.Change) error {
 
 	// 记一条。压实用它判断「日志比存活数据大多少倍」。
 	p.writes.Add(1)
+	return nil
+}
+
+// ImportMarker 记录一次语料导入已经完成。
+//
+// 它的用处是**避免每次启动都重跑一遍导入**：`-import` 原本无条件执行，
+// 于是带持久化的部署光是重启就让日志膨胀。
+//
+// 它把当时的参数也记下来，好在参数变了的时候给出提示——
+// 「有没有标记」本身回答不了「这次要导的和上次一样吗」。
+type ImportMarker struct {
+	// Dir 是导入的语料目录；只有 -generate 时为空。
+	Dir string
+
+	// Files 与 Bytes 是当时导入的规模，只给人看。
+	Files int
+	Bytes int64
+
+	// Generate 是当时 -generate 指定的篇数。
+	Generate int
+}
+
+// MarkImported 记录「这个目录已经导入过了」。
+//
+// 标记追加在**同一个日志**里、且在所有文档记录之后，因此它与数据
+// 共用 fsync 批次：标记落盘时数据必然也已落盘。这正是它不用另一个
+// 文件的原因——分成两个文件就可能出现「标记说导入完了，但数据没刷
+// 下去」，崩溃后变成跳过导入却什么也没有。
+//
+// 没有启用持久化时是空操作（反正重启什么都不剩）。
+func (t *Table) MarkImported(m ImportMarker) error {
+	if t.persist == nil {
+		return nil
+	}
+	return t.persist.markImported(m)
+}
+
+// Imported 返回日志里记录的导入标记；从未导入过时第二个返回值为 false。
+func (t *Table) Imported() (ImportMarker, bool) {
+	if t.persist == nil {
+		return ImportMarker{}, false
+	}
+	m := t.persist.imported.Load()
+	if m == nil {
+		return ImportMarker{}, false
+	}
+	return *m, true
+}
+
+// markImported 追加一条导入标记并立刻刷盘。
+func (p *persistState) markImported(m ImportMarker) error {
+	if err := p.check(); err != nil {
+		return err
+	}
+
+	// 刻意新分配而不是复用 p.scratch：那个缓冲之所以不用加锁，
+	// 是因为 apply 由索引在写锁内调用。这里不在那把锁里，
+	// 共用它就是数据竞争。标记很小，一次分配无所谓。
+	payload := wal.EncodeImportDone(wal.ImportRecord{
+		Dir:      m.Dir,
+		Files:    m.Files,
+		Bytes:    m.Bytes,
+		Generate: m.Generate,
+	}, nil)
+
+	if err := p.log.Append(wal.KindImportDone, payload); err != nil {
+		p.degrade(err)
+		return err
+	}
+	p.writes.Add(1)
+
+	// 立刻刷盘：这是一个一次性的动作，让它当场落地可以省掉
+	// 「导入完成了但标记没持久，重启又白导一遍」这种浪费。
+	if err := p.log.Sync(); err != nil {
+		p.degrade(err)
+		return err
+	}
+
+	p.imported.Store(&m)
 	return nil
 }
 
@@ -322,6 +406,7 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 		upserts  int
 		deletes  int
 		declares int
+		imports  int
 		skipped  int
 		recordNo int
 	)
@@ -330,6 +415,17 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 		recordNo++
 
 		switch k {
+		case wal.KindImportDone:
+			// 导入标记。它只是个「做过这件事」的记号，不改变索引内容。
+			rec, err := wal.DecodeImportDone(payload)
+			if err != nil {
+				return fmt.Errorf("第 %d 条记录（import-done）解析失败: %w", recordNo, err)
+			}
+			p.imported.Store(&ImportMarker{
+				Dir: rec.Dir, Files: rec.Files, Bytes: rec.Bytes, Generate: rec.Generate,
+			})
+			imports++
+
 		case wal.KindDeclare:
 			// 字段类型声明。它通常出现在文档之前（建表时写下），
 			// 也可能夹在文档之间（动态映射后来才遇到新字段）。
@@ -391,11 +487,12 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 	}
 
 	// 记下日志里现有的条数：压实就是拿它和存活文档数比。
-	p.writes.Store(int64(upserts + deletes + declares))
+	p.writes.Store(int64(upserts + deletes + declares + imports))
 
-	if logger != nil && (upserts > 0 || deletes > 0 || declares > 0) {
+	if logger != nil && (upserts > 0 || deletes > 0 || declares > 0 || imports > 0) {
 		logger.Info("持久化日志重放完成",
 			"upserts", upserts, "deletes", deletes, "declares", declares,
+			"imports", imports,
 			"skipped_deletes", skipped, "log_bytes", p.log.Size())
 	}
 	return nil

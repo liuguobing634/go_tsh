@@ -46,12 +46,13 @@ const (
 	//   - v1：upsert 只有「名字 + 值」
 	//   - v2：upsert 每个字段多一个类型字节（动态映射要在重启后复现）
 	//   - v3：新增声明字段类型的记录类型（空表的 schema 也要活过重启）
+	//   - v4：新增「导入已完成」的记录类型（避免每次启动重复导入）
 	//
-	// v3 并没有改变已有记录的**布局**——它只是多了一种记录类型。
-	// 之所以仍然要升版本号：旧二进制读到不认识的类型会把它当成
-	// 损坏数据并拒绝启动，那个报错（「日志损坏」）会把人引向完全
-	// 错误的方向。升版本号能让它干净地说出「版本不支持」。
-	FormatVersion uint8 = 3
+	// v3/v4 都没有改变已有记录的**布局**——它们只是多了记录类型。
+	// 之所以仍然要升版本号：旧二进制读到不认识的类型会当成文件尾部截断，
+	// 而那条记录**后面可能还有文档记录**，于是静默丢数据。
+	// 升版本号能让它干净地说出「版本不支持」。
+	FormatVersion uint8 = 4
 
 	// legacyFormatVersion 是仍然可以**读**的最旧版本。
 	//
@@ -116,13 +117,25 @@ const (
 	// 在重启后会丢掉全部类型信息，之后写进去的数据会被按推断的类型
 	// 重新解释——数字变成文本，范围查询随之失效。
 	KindDeclare Kind = 3
+
+	// KindImportDone 表示「某个语料目录已经导入过了」。
+	//
+	// 它解决的是一个很实际的坑：`-import` 原本每次启动都会重跑一遍，
+	// 于是带持久化的部署**光是重启就让日志膨胀**——实测 20 篇语料
+	// 连开 4 次，日志变成语料的 4.4 倍，重放条数从 20 条涨到 60 条。
+	//
+	// 标记与文档记录在**同一个日志**里，因此共用 fsync 批次：
+	// 标记落盘时，它之前的文档必然也已经落盘。分成两个文件就做不到
+	// 这一点——「标记说导入完了，但数据还没刷下去」是可能的，
+	// 那会在崩溃后变成「跳过导入却什么也没有」。
+	KindImportDone Kind = 4
 )
 
 // knownKinds 是当前能识别的全部记录类型。
 //
 // 扫描时用它判断记录是否有效：认不出的类型会让扫描在**该条记录的开头**
 // 停下，并被当成文件尾部截断处理。
-var knownKinds = [...]Kind{KindUpsert, KindDelete, KindDeclare}
+var knownKinds = [...]Kind{KindUpsert, KindDelete, KindDeclare, KindImportDone}
 
 func isKnownKind(k Kind) bool {
 	for _, known := range knownKinds {
@@ -141,6 +154,8 @@ func (k Kind) String() string {
 		return "delete"
 	case KindDeclare:
 		return "declare"
+	case KindImportDone:
+		return "import-done"
 	default:
 		return fmt.Sprintf("unknown(%d)", uint8(k))
 	}

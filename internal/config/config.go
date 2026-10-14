@@ -92,6 +92,13 @@ type Config struct {
 
 	// ImportTable 是 -import / -generate 的目标表，为空表示默认表。
 	ImportTable string
+
+	// Reimport 强制重跑一次语料导入。
+	//
+	// 正常情况下导入只做一次：完成后会在日志里留下标记，之后启动直接跳过。
+	// 语料目录的内容变了、或者换了目录，需要显式加这个开关——
+	// 隐式重导会让「我只是往目录里加了一个文件」变成一次全量重写。
+	Reimport bool
 }
 
 // 支持的字段类型名，与 pkg/tsh 的 FieldKind 对应。
@@ -246,6 +253,7 @@ func registerFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.StringVar(&cfg.Mapping, "mapping", cfg.Mapping, `字段类型声明，如 "created:date,sku:keyword"（作用在默认表上）`)
 	fs.StringVar(&cfg.MappingFile, "mapping-file", cfg.MappingFile, "按表声明字段类型的 JSON 文件")
 	fs.StringVar(&cfg.ImportTable, "import-table", cfg.ImportTable, "导入与合成的目标表名，默认为 default")
+	fs.BoolVar(&cfg.Reimport, "reimport", cfg.Reimport, "强制重跑一次语料导入（默认只在首次启动时导入）")
 }
 
 // Usage 把全部命令行参数的说明写到 w。
