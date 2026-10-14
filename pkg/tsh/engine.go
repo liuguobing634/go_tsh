@@ -1,8 +1,41 @@
 // Package tsh 提供 go_tsh 搜索引擎的门面，可被其他 Go 程序直接嵌入使用。
 //
-// 门面把三块拼在一起：倒排索引（internal/index）、查询与打分
-// （internal/query + internal/scoring）、高亮（internal/highlight）。
-// 对外只暴露与 HTTP API 一一对应的类型，不泄漏内部结构。
+// 引擎跑在调用方自己的进程里，不需要额外部署服务：
+//
+//	engine, err := tsh.NewWith(tsh.Options{
+//		Analyzer: tsh.AnalyzerChinese,
+//		DataDir:  "./data", // 留空则纯内存
+//		Schema: map[string]tsh.FieldKind{
+//			"title":   tsh.FieldText,
+//			"price":   tsh.FieldNumber,
+//			"created": tsh.FieldDate,
+//		},
+//	})
+//	if err != nil {
+//		return err
+//	}
+//	defer engine.Close()
+//
+//	engine.Upsert(tsh.Document{
+//		ID:      "p1",
+//		Fields:  map[string]string{"title": "笔记本电脑"},
+//		Numbers: map[string]float64{"price": 4999},
+//	})
+//
+//	res, err := engine.Search(tsh.SearchRequest{Query: "title:笔记本", Limit: 10})
+//
+// 更完整的例子见仓库的 examples/blog。
+//
+// # 表
+//
+// Engine 持有一组**互相隔离的表**。Engine 上直接调用的方法都作用在
+// DefaultTable 上；用 Table(name) 可以拿到具体表的句柄。
+// 每张表有自己的 schema、文档与日志文件。
+//
+// # 依赖
+//
+// 这个包是纯 Go 的，不依赖任何命令行解析、HTTP 或配置文件——
+// 那些是 pkg/httpapi 与 cmd/tshd 的事。
 package tsh
 
 import (

@@ -7,8 +7,26 @@ import (
 
 // SearchRequest 描述一次检索。
 type SearchRequest struct {
-	// Query 是查询串。语法：bare term、`"短语"`、`-排除`、
-	// AND / OR / NOT、括号，详见 internal/query 的包注释。
+	// Query 是查询串。
+	//
+	// # 语法
+	//
+	//	term               词条（会经分析器归一化：大小写、分词、停用词）
+	//	"some phrase"      短语，要求词条位置连续
+	//	-term  /  NOT term 排除
+	//	a AND b            两者都要（也支持 &&）
+	//	a OR b             任一即可（也支持 ||）
+	//	(a OR b) AND c     括号分组
+	//	field:term         限定字段
+	//	field:[10 TO 100]  闭区间；`{` `}` 表示开区间，`*` 表示无界
+	//	field:>=10         比较运算符（等价于 field:[10 TO *]）
+	//
+	// 字段限定与范围查询**只对声明过类型的字段有意义**：
+	// number / date 支持等值与范围，keyword 支持整值精确匹配，
+	// text 只能做词条与短语查询（对它做范围查询会报错，不会静默返回空）。
+	//
+	// 冒号是字段分隔符，因此 `a:b` 是「字段 a 里的 b」而不是一个普通词条。
+	// 字段名不允许数字开头，所以时间戳这类写法不会被误拆。
 	Query string
 
 	// Fields 限定检索字段；为空表示全部字段。

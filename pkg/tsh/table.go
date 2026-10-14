@@ -14,8 +14,8 @@ import (
 //
 // Engine 上直接调用的那些方法（Create / Upsert / Search / ...）都作用在
 // 它上面。有了这个常量，外部调用方就不必硬编码 "default"——
-// internal/tablename 是外部 module 拿不到的（跨 module 的 apicheck
-// 门禁就是这么发现这个缺口的）。
+// 表名校验那个包是 internal 的，外部 module 拿不到它。
+// 这个缺口就是跨 module 的 apicheck 门禁发现的。
 const DefaultTable = tablename.Default
 
 // Table 是一张表：一套独立的索引、检索器、高亮器与持久化日志。
