@@ -194,6 +194,33 @@ if ($pkgDirs.Count -eq 0) {
 
 Invoke-Checked 'go vet' { & $GoExe vet $Package }
 
+# The external-consumer compile gate.
+#
+# apicheck/ is a separate module that replaces ../ and uses only the public
+# API. It exists because in-module tests CANNOT catch a broken public surface:
+# even `package tsh_test` lives inside this module and may import internal
+# packages, so "the type is not nameable from outside" never shows up there.
+#
+# This is a compile-only check - it never runs the binary.
+$apiCheckDir = Join-Path $repoRoot 'apicheck'
+if (Test-Path (Join-Path $apiCheckDir 'go.mod')) {
+    $apiProxy = if ($GoProxy) { $GoProxy } else { 'off' }
+    Invoke-Checked 'apicheck (external consumer)' {
+        Push-Location $apiCheckDir
+        try {
+            $env:GOFLAGS = '-mod=mod'
+            $env:GOPROXY = $apiProxy
+            $env:GOSUMDB = 'off'
+            & $GoExe build ./...
+        } finally {
+            Remove-Item Env:\GOFLAGS -ErrorAction SilentlyContinue
+            Remove-Item Env:\GOPROXY -ErrorAction SilentlyContinue
+            Remove-Item Env:\GOSUMDB -ErrorAction SilentlyContinue
+            Pop-Location
+        }
+    }
+}
+
 # The race detector needs cgo and a C compiler. Degrade gracefully instead of
 # failing the gate for a purely environmental reason.
 $cc = Find-CCompiler
