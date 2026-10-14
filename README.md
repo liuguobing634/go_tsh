@@ -3,12 +3,13 @@
 用 Go 从零实现的全文搜索服务：**单二进制、手写内存倒排索引、HTTP JSON API**。
 
 > 当前进度：**Phase 0–5 全部完成**，并已加入**中文分词与检索**、
-> **L1 文档持久化**（追加式原文日志 + 启动重放）、
-> **类型化字段与范围查询**、**表（多命名空间）**。
+> **L1 文档持久化**（追加式原文日志 + 启动重放 + 自动压实）、
+> **类型化字段与范围查询**、**表（多命名空间）**、**排序**。
 > 10 万篇规模下检索 P99 < 20ms；`make check`（含 `-race`）全绿。
-> 性能数据与压测记录见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，
-> 中文支持的实测对比与设计见 [docs/CHINESE.md](docs/CHINESE.md)，
-> 持久化与表的方案、实测代价与后续计划见 [PLAN.md](PLAN.md) 的 Phase 8 / 11。
+> 想嵌进自己的 Go 程序看 **[docs/EMBEDDING.md](docs/EMBEDDING.md)**，
+> 性能与容量数据见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)，
+> 中文支持的实测对比见 [docs/CHINESE.md](docs/CHINESE.md)，
+> 方案与取舍见 [PLAN.md](PLAN.md)。
 
 > **依赖说明（相对原计划的修订）**
 >
@@ -571,22 +572,15 @@ engine.Upsert(tsh.Document{
 res, _ := engine.Search(tsh.SearchRequest{Query: "name:笔记本", Limit: 10})
 ```
 
-想同时提供 HTTP 接口，又不想被接管整个 Server：
+➡️ **完整指南见 [docs/EMBEDDING.md](docs/EMBEDDING.md)**：字段类型与为什么不能猜、
+`Create` / `Upsert` 的区别、查询语法、排序的三条规则、表的隔离、
+持久化与压实、并发模型、接自己的 HTTP 接口、**六个常见陷阱**、API 速查。
 
-```go
-api := httpapi.New(httpapi.DefaultOptions(), engine, logger)
-
-mux := http.NewServeMux()
-api.Register(mux)                        // 路由进自己的 mux
-mux.HandleFunc("GET /my/custom", myHandler)
-http.ListenAndServe(":8080", api.Wrap(mux))  // 中间件套在最外层
-```
-
-`apicheck/` 是一个**跨 module** 的编译门禁：它用 `replace` 指回本仓库，
-因此受和真实用户完全相同的 `internal` 规则约束。
+`apicheck/` 是一道**跨 module** 的编译门禁：它用 `replace` 指回本仓库、
+以外部 module 的身份编译，因此受和真实用户完全相同的 `internal` 规则约束。
 仓库内的测试测不到这件事——`package tsh_test` 虽然在别的包里，
 但仍在同一个 module 内，照样能 import `internal`。
-「外部用户拿不到这个类型」只有跨 module 才暴露得出来。
+**EMBEDDING.md 里出现的每个 API 都由它守着**，所以文档不会漂移。
 
 ## 故障排查
 

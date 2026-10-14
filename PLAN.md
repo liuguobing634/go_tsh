@@ -1905,6 +1905,29 @@ curl ".../search?q=category:go&sort=created:desc,likes:asc"
 
 #### 12.6 P2：嵌入体验 ✅ 已完成
 
+- [x] **`docs/EMBEDDING.md`**：完整的嵌入指南（本轮补）
+
+      12 节：什么时候该嵌入 vs 起服务、最小可用、生命周期、字段类型与
+      为什么不能猜、写入、检索（含完整语法表）、表、持久化与压实、
+      并发模型、接自己的 HTTP 接口、**六个常见陷阱**、容量、API 速查。
+
+      README 那一节改成摘要 + 指向它，避免两处各写一半而逐渐不一致。
+
+- [x] **文档里的每个 API 都由 `apicheck` 编译守着**
+
+      写文档的过程本身抓到了一个真实缺口：文档里写了
+      `tsh.ErrDocumentExists`，而 `go doc` 里**根本没有这个符号**——
+      文档级错误（`ErrDocumentExists` / `ErrDocumentNotFound` /
+      `ErrTooManyFields` / `ErrDocumentTooLarge` / 四个字段类型错误）
+      都没有转发，外部用户只能去**匹配错误文案**。
+
+      这正是我在别处一直明确避免的做法：改一个字的措辞就会让下游的
+      `strings.Contains` 静默失效，症状是「本该 409 的变成了 500」。
+
+      已加 `pkg/tsh/errors.go` 转发这 10 个错误，并把 `apicheck` 扩成
+      **覆盖 EMBEDDING.md 全部 API** 的门禁。反向验证过：把
+      `ErrDocumentExists` 改个名，门禁立刻失败。
+
 - [x] GoDoc 友好：所有导出的类型与函数都有说明，且**不出现 internal 包链接**
 
       实测修掉的：`SearchRequest.Query` 原来写着「详见 internal/query 的
@@ -1927,9 +1950,8 @@ curl ".../search?q=category:go&sort=created:desc,likes:asc"
 
 - [x] `apicheck` 门禁随 CI 一起跑（`scripts/check.ps1` 的第三步）。
 
-      实测这道德价值：本轮它抓到了两个真实缺口——`tablename.Default`
-      外部拿不到（补了 `tsh.DefaultTable`），以及 `-import` 标记相关的
-      API 之前根本不存在。
+      实测这道的价值：本轮之前它抓到了 `tablename.Default` 外部拿不到
+      （补了 `tsh.DefaultTable`）；本轮又抓到文档级错误没转发。
 
 #### 12.7 明确的非目标 ✅ 已写进 README
 

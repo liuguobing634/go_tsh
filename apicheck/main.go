@@ -12,18 +12,25 @@
 // 所以这个目录是一道编译门禁：它必须始终能 `go build`。
 // 由 scripts/check.ps1 执行。
 //
-// # 它测的是什么
+// # 它覆盖什么
 //
-// 不是功能正确性（那由仓库内的单测负责），而是**对外 API 的可用性**：
-// 类型能不能被命名、配置能不能被构造、返回值能不能用。
+// **docs/EMBEDDING.md 里出现的每一个 API**。这样文档不会漂移：
+// 写了不存在的函数、改了签名、删了导出符号，这里立刻编译不过。
 //
-// 历史上它抓到过两个真实问题：
+// 不测功能正确性——那由仓库内的单测负责。
+//
+// # 它抓到过的真实问题
+//
 //   - 配置字段是 internal 类型，外部写不出 `tsh.Options{Index: ...}`
-//     这样自然的复合字面量；修复方式是类型别名 + DefaultOptions。
-//   - HTTP 层整个在 internal 里，外部挂不进自己的进程（见文末）。
+//     这样自然的复合字面量（修复：类型别名 + DefaultOptions）
+//   - HTTP 层整个在 internal 里，外部挂不进自己的进程（修复：pkg/httpapi）
+//   - 外部拿不到默认表名，只能硬编码 "default"（修复：tsh.DefaultTable）
+//   - 文档级错误没转发，外部只能匹配错误文案
+//     （修复：pkg/tsh/errors.go）
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -35,14 +42,31 @@ import (
 )
 
 func main() {
-	// ---- 1. 拿一份默认值再改：新用户最需要的入口 ----
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+	// ============================================================
+	// 《最小可用》：零值 Options 就是一套合理默认
+	// ============================================================
+	simple, err := tsh.NewWith(tsh.Options{})
+	if err != nil {
+		panic(err)
+	}
+	if err := simple.Close(); err != nil {
+		panic(err)
+	}
+
+	// tsh.New() 是简写，不会失败
+	_ = tsh.New().Close()
+
+	// ============================================================
+	// 《字段类型》：DefaultOptions + 复合字面量 + 字段式赋值
+	// ============================================================
 	opts := tsh.DefaultOptions()
 	opts.Analyzer = tsh.AnalyzerChinese
 	opts.Logger = logger
+	opts.DataDir = "" // 纯内存
 
-	// ---- 2. 复合字面量必须写得出来（类型名要能被外部命名）----
+	// 复合字面量必须写得出来（类型名要能被外部命名）
 	opts2 := tsh.Options{
 		Analyzer: tsh.AnalyzerStandard,
 		Index: tsh.IndexOptions{
@@ -56,19 +80,20 @@ func main() {
 		Highlight: tsh.HighlightOptions{
 			MaxLen: 200,
 		},
+		SyncInterval: 100 * time.Millisecond,
 	}
 
-	// ---- 3. 字段式赋值也要能用（两条路都通）----
+	// 字段式赋值也要能用
 	opts.Index.MaxFields = 32
 	opts.BM25.K1 = 1.2
 
-	// ---- 4. 按表声明 schema ----
-	opts.TableSchemas = map[string]map[string]tsh.FieldKind{
+	// 表级 schema
+	opts2.TableSchemas = map[string]map[string]tsh.FieldKind{
 		"products": {
 			"name":    tsh.FieldText,
+			"sku":     tsh.FieldKeyword,
 			"price":   tsh.FieldNumber,
 			"created": tsh.FieldDate,
-			"sku":     tsh.FieldKeyword,
 		},
 	}
 
@@ -76,96 +101,217 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
-	// ---- 5. 写入：文本 / 数值 / 时间 三种 ----
-	if _, err := engine.Upsert(tsh.Document{
-		ID:      "p1",
-		Fields:  map[string]string{"name": "笔记本电脑"},
-		Numbers: map[string]float64{"price": 4999},
-		Dates:   map[string]time.Time{"created": time.Now()},
+	// ============================================================
+	// 《写入》：四张字段表
+	// ============================================================
+	_, err = engine.Upsert(tsh.Document{
+		ID:       "p1",
+		Fields:   map[string]string{"name": "笔记本电脑", "body": "轻薄的开发本"},
+		Keywords: map[string]string{"sku": "LAP-1"},
+		Numbers:  map[string]float64{"price": 4999, "stock": 12},
+		Dates:    map[string]time.Time{"created": time.Now().UTC()},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	// Create 只新建；已存在返回 ErrDocumentExists
+	if err := engine.Create(tsh.Document{
+		ID: "p2", Fields: map[string]string{"name": "机械键盘"},
+	}); err != nil && !errors.Is(err, tsh.ErrDocumentExists) {
+		panic(err)
+	}
+
+	// Delete / GetDocument
+	if err := engine.Delete("p2"); err != nil && !errors.Is(err, tsh.ErrDocumentNotFound) {
+		panic(err)
+	}
+	if _, ok := engine.GetDocument("p1"); !ok {
+		panic("p1 应当存在")
+	}
+
+	// 从 JSON 原生值构造（会查字段类型表）
+	if _, err := engine.ParseDocument("p3", map[string]any{
+		"name":    "显示器",
+		"sku":     "MON-1",
+		"price":   1299,
+		"created": "2024-03-15T00:00:00Z",
+		"gone":    nil,
 	}); err != nil {
 		panic(err)
 	}
 
-	// ---- 6. JSON 原生值入口（HTTP 层的同款）----
-	if _, err := engine.ParseDocument("p2", map[string]any{
-		"name":  "机械键盘",
-		"price": 499,
+	// 不查类型表的版本
+	if _, err := tsh.DocumentFromValues("p4", map[string]any{
+		"name": "鼠标", "onSale": true,
 	}); err != nil {
 		panic(err)
 	}
 
-	// ---- 7. 检索 ----
-	res, err := engine.Search(tsh.SearchRequest{Query: "name:笔记本", Limit: 10})
+	// ============================================================
+	// 《检索》：语法、排序、字段限定、高亮
+	// ============================================================
+	sortKeys, err := tsh.ParseSort("created:desc,price:asc")
+	if err != nil {
+		panic(err)
+	}
+
+	res, err := engine.Search(tsh.SearchRequest{
+		Query:     `category:electronics AND price:[1000 TO 6000] AND "轻薄" AND -缺货`,
+		Fields:    []string{"name", "body"},
+		Sort:      sortKeys,
+		Limit:     20,
+		Offset:    0,
+		Highlight: true,
+	})
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("命中", res.Total)
 
-	// ---- 8. 表的生命周期 ----
-	if _, err := engine.CreateTable("articles", map[string]tsh.FieldKind{
-		"title": tsh.FieldText,
-	}); err != nil && err != tsh.ErrTableExists {
+	for _, h := range res.Hits {
+		_, _, _, _ = h.ID, h.Score, h.Fields, h.Highlights
+	}
+
+	// 结构化构造排序键
+	_, err = engine.Search(tsh.SearchRequest{
+		Query: "name:笔记本",
+		Sort:  []tsh.SortKey{{Field: "price", Desc: true}},
+	})
+	if err != nil {
 		panic(err)
 	}
-	for _, name := range engine.TableNames() {
-		fmt.Println("表:", name)
+
+	// ============================================================
+	// 《表》：句柄、列表、建删、统计
+	// ============================================================
+	products, err := engine.Table("products")
+	if err != nil {
+		panic(err)
 	}
-	for field, kind := range engine.Schema() {
-		fmt.Println("字段:", field, kind)
+	_ = products.Name()
+
+	if _, err := engine.CreateTable("articles", map[string]tsh.FieldKind{
+		"title": tsh.FieldText,
+	}); err != nil && !errors.Is(err, tsh.ErrTableExists) {
+		panic(err)
+	}
+
+	for _, name := range engine.TableNames() {
+		_ = name
 	}
 	for _, st := range engine.TableStats() {
-		fmt.Println("统计:", st.Name, st.Stats.Docs)
+		_, _ = st.Name, st.Stats.Docs
+	}
+	for field, kind := range engine.Schema() {
+		_, _ = field, kind
+	}
+	for _, f := range engine.Fields() {
+		_ = f
+	}
+	_ = engine.Stats()
+	_ = engine.Index()
+	_ = tsh.DefaultTable
+
+	if err := engine.DropTable("articles"); err != nil && !errors.Is(err, tsh.ErrTableNotFound) {
+		panic(err)
 	}
 
-	// ---- 9. 更细粒度的控制 ----
-	_ = engine.Index()
-
-	// ---- 9b. 持久化压实的可观测性与手动触发 ----
-	//
-	// 自动压实会在日志明显大于存活数据时自己跑；这两个读数是
-	// 「重启要做多少无用功」的度量，手动触发留给「停机前先把
-	// 重启时间压下去」这类场景。
+	// ============================================================
+	// 《持久化》：压实、可观测性、导入标记
+	// ============================================================
 	tb, err := engine.Table(tsh.DefaultTable)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("日志字节:", tb.LogBytes(), "记录条数:", tb.LogRecords())
+
+	_ = tb.Persisted()
+	_ = tb.LogBytes()
+	_ = tb.LogRecords()
+
 	if err := tb.Compact(); err != nil {
+		panic(err) // 纯内存时是无害的空操作
+	}
+	tb.MaybeCompact()
+
+	if err := tb.MarkImported(tsh.ImportMarker{Dir: "corpus", Files: 3}); err != nil {
+		panic(err)
+	}
+	if mark, ok := tb.Imported(); ok {
+		_, _, _, _ = mark.Dir, mark.Files, mark.Bytes, mark.Generate
+	}
+
+	// Table 上的完整方法面
+	if err := tb.Create(tsh.Document{ID: "t1", Fields: map[string]string{"name": "x"}}); err != nil &&
+		!errors.Is(err, tsh.ErrDocumentExists) {
+		panic(err)
+	}
+	_, _ = tb.Upsert(tsh.Document{ID: "t2", Fields: map[string]string{"name": "y"}})
+	_, _ = tb.GetDocument("t2")
+	_, _ = tb.Search(tsh.SearchRequest{Query: "name:y"})
+	_, _ = tb.ParseDocument("t3", map[string]any{"name": "z"})
+	_ = tb.Schema()
+	_ = tb.Fields()
+	_ = tb.Stats()
+	_ = tb.Index()
+	if err := tb.Delete("t2"); err != nil && !errors.Is(err, tsh.ErrDocumentNotFound) {
+		panic(err)
+	}
+	if err := tb.Close(); err != nil && !errors.Is(err, tsh.ErrPersistenceBroken) {
 		panic(err)
 	}
 
-	// ---- 10. 错误要能被程序化判断，而不是解析文案 ----
-	_, err = engine.Table("nope")
-	fmt.Println("表不存在可判定:", err == tsh.ErrTableNotFound)
+	// ============================================================
+	// 错误都要能被 errors.Is 判断（不能只靠匹配文案）
+	// ============================================================
+	for _, e := range []error{
+		tsh.ErrEmptyExternalID, tsh.ErrEmptyFieldName,
+		tsh.ErrDocumentExists, tsh.ErrDocumentNotFound,
+		tsh.ErrTooManyFields, tsh.ErrDocumentTooLarge,
+		tsh.ErrFieldKindConflict, tsh.ErrInvalidFieldKind,
+		tsh.ErrNotNumericField, tsh.ErrInvalidFieldValue,
+		tsh.ErrNoFields, tsh.ErrPersistenceBroken,
+		tsh.ErrTableNotFound, tsh.ErrTableExists,
+		tsh.ErrTooManyTables, tsh.ErrCannotDropDefault,
+		tsh.ErrEngineClosed, tsh.ErrUnsupportedFieldType,
+		tsh.ErrAmbiguousField, tsh.ErrIntegerTooLarge,
+	} {
+		_ = errors.Is(nil, e)
+	}
 
-	// ---- 11. 把 HTTP 接口挂进**自己的**进程 ----
-	//
-	// 这是「保留对外 API，方便后面独立部署」这条需求的验收点。
-	// 此前 HTTP 层在 internal/ 里，外部根本 import 不了。
-	api := httpapi.New(httpapi.Options{
+	// ============================================================
+	// 《接自己的 HTTP 接口》
+	// ============================================================
+	httpOpts := httpapi.DefaultOptions()
+	httpOpts.Addr = "127.0.0.1:0"
+	if err := httpOpts.Validate(); err != nil {
+		panic(err)
+	}
+	httpOpts.MaxBodyBytes = 8 << 20 // 字段式赋值
+	httpOpts2 := httpapi.Options{   // 复合字面量
 		Addr:         "127.0.0.1:0",
 		MaxBodyBytes: 8 << 20,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
-	}, engine, logger)
+	}
 
-	// 两种挂法。这里演示的是「挂到自己的 mux 上」——
-	// 嵌入方通常要和自己的路由、自己的中间件共存，而不是被接管整个 Server。
+	api := httpapi.New(httpOpts2, engine, logger)
+	_ = api.Engine()
+	_ = api.Options()
+
+	// 挂到自己的 mux 上：自己的路由与本包路由共存
 	mux := http.NewServeMux()
 	api.Register(mux)
 	mux.HandleFunc("GET /my/custom", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	// 中间件要的话自己套一层；不要就直接用 mux。
-	_ = api.Wrap(mux)
+	// 中间件单独套一层；不要就直接用 mux
+	var _ http.Handler = api.Wrap(mux)
 
-	// 只想单独跑一个搜索服务时，New 返回的 Server 本身就能用：
-	//	if err := api.ListenAndServe(); err != nil { ... }
-	//
-	// 而且不用把整个 Server 交给它——可以只借它的 Handler：
-	_ = api.Handler
+	// 也可以让它自己就是一个服务（内嵌 *http.Server）
+	var _ http.Handler = api.Handler
 }
