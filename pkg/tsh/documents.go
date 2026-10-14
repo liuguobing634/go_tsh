@@ -64,8 +64,13 @@ func (t *Table) Create(doc Document) error {
 	if err != nil {
 		return err
 	}
-	_, err = t.idx.Add(doc.ID, fields)
-	return err
+	if _, err = t.idx.Add(doc.ID, fields); err != nil {
+		return err
+	}
+
+	// 必须在索引锁**之外**：压实会去取读锁取证，在写锁里调用会死锁。
+	t.MaybeCompact()
+	return nil
 }
 
 // Upsert 写入文档：不存在则新建，存在则整体覆盖。
@@ -83,8 +88,12 @@ func (t *Table) Upsert(doc Document) (created bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	_, created, err = t.idx.Upsert(doc.ID, fields)
-	return created, err
+	if _, created, err = t.idx.Upsert(doc.ID, fields); err != nil {
+		return false, err
+	}
+
+	t.MaybeCompact()
+	return created, nil
 }
 
 // Delete 删除文档。
@@ -94,7 +103,47 @@ func (t *Table) Delete(id string) error {
 	if err := t.persist.check(); err != nil {
 		return err
 	}
-	return t.idx.Delete(id)
+	if err := t.idx.Delete(id); err != nil {
+		return err
+	}
+
+	t.MaybeCompact()
+	return nil
+}
+
+// Compact 立即把日志重写成当前存活文档的快照，不等自动触发。
+//
+// 正常情况下不需要手动调用：日志明显大于存活数据时会自动压实
+// （见 MaybeCompact）。它留给两类场景：
+//
+//   - 已知接下来要停机，想在停机前把重启时间压下去；
+//   - 刚做完一大批删除，想把磁盘立刻还回来。
+//
+// 没有启用持久化时是空操作。
+func (t *Table) Compact() error {
+	if t.persist == nil {
+		return nil
+	}
+	return t.persist.compact(t)
+}
+
+// LogBytes 返回这张表持久化日志的字节数；未启用持久化时返回 0。
+func (t *Table) LogBytes() int64 {
+	if t.persist == nil || t.persist.log == nil {
+		return 0
+	}
+	return t.persist.log.Size()
+}
+
+// LogRecords 返回日志里当前的记录条数（重放所得 + 之后每次写 +1，
+// 压实后重置）。未启用持久化时返回 0。
+//
+// 它和存活文档数的比值就是「重启要做多少无用功」的度量。
+func (t *Table) LogRecords() int64 {
+	if t.persist == nil {
+		return 0
+	}
+	return t.persist.writes.Load()
 }
 
 // GetDocument 取回文档；第二个返回值表示是否存在。

@@ -48,7 +48,8 @@ var ErrPersistenceBroken = errors.New("tsh: 持久化已降级，拒绝写入")
 
 // persistState 承载引擎的持久化状态。
 type persistState struct {
-	log *wal.Log
+	log    *wal.Log
+	logger *slog.Logger
 
 	// replaying 为 true 时钩子不写日志。
 	//
@@ -58,6 +59,16 @@ type persistState struct {
 
 	// broken 非 nil 表示已经降级，内容是最初的失败原因。
 	broken atomic.Pointer[brokenState]
+
+	// writes 是日志里当前的记录条数（重放前是重放到的条数，
+	// 之后每写一条加一）。压实后重置为存活文档数。
+	//
+	// 用它而不是字节数来判断何时压实：真正拖慢重启的是**要重放的条数**
+	// ——每条都要走一遍分析、还要摘除旧版本；字节数还受文档长度干扰。
+	writes atomic.Int64
+
+	// compacting 保证同一时刻只有一次压实。
+	compacting atomic.Bool
 
 	// scratch 是编码 payload 的复用缓冲。
 	//
@@ -124,6 +135,144 @@ func (p *persistState) apply(c index.Change) error {
 		// 让后续写直接失败，避免分歧继续扩大。
 		p.degrade(err)
 		return err
+	}
+
+	// 记一条。压实用它判断「日志比存活数据大多少倍」。
+	p.writes.Add(1)
+	return nil
+}
+
+// 压实的阈值。
+const (
+	// compactRatio 是触发压实的记录数倍数。
+	//
+	// 记录数超过存活文档数的这个倍数时就压实。取 3 是个折中：
+	// 再低会让压实过于频繁（每次写都可能触发），
+	// 再高则重启代价已经开始明显（3 倍记录 ≈ 3 倍重放时间）。
+	compactRatio = 3
+
+	// compactMinRecords 是触发压实的记录数下限。
+	//
+	// 小索引（几篇文档反复更新）倍数很容易超标，但压实的收益
+	// 完全抵不上它的开销与噪声。低于这个条数就随它去。
+	compactMinRecords = 512
+)
+
+// shouldCompact 判断当前是否值得压实。
+//
+// liveDocs 是存活文档数。
+func (p *persistState) shouldCompact(liveDocs int) bool {
+	if p == nil || p.log == nil {
+		return false
+	}
+	if p.compacting.Load() {
+		return false
+	}
+
+	records := p.writes.Load()
+	if records < compactMinRecords {
+		return false
+	}
+	return records > int64(liveDocs)*compactRatio
+}
+
+// compact 把日志重写成「当前存活文档的快照」。
+//
+// 重写后日志体积回到约 1 倍数据量、重启重放条数回到文档数量级。
+//
+// # 两个阶段，锁的边界不同
+//
+//  1. **取证**：在索引的同一把读锁内拿到全部存活文档与日志偏移 mark。
+//     两者必须一致——mark 偏大就会丢掉那段记录。
+//  2. **序列化**：不持任何锁，可能写几百 MB。锁住它等于把所有写请求
+//     停住好几秒，而这一步恰恰是最慢的。
+//
+// 真正的切换（接增量 + fsync + 改名）由 wal.Log.Compact 在短锁内完成。
+func (p *persistState) compact(t *Table) error {
+	if !p.compacting.CompareAndSwap(false, true) {
+		return nil // 已有一次在跑
+	}
+	defer p.compacting.Store(false)
+
+	// ---- 取证 ----
+	var (
+		docs []*index.Document
+		mark int64
+	)
+	t.idx.View(func(v *index.View) {
+		// 传出来的是索引内部持有的指针。它不会被修改
+		// （Upsert 覆盖时会创建新对象），所以带出锁外是安全的。
+		v.EachDocument(func(d *index.Document) bool {
+			docs = append(docs, d)
+			return true
+		})
+		// Size() 会取日志自己的锁，与索引锁无关，不会死锁。
+		mark = p.log.Size()
+	})
+
+	// schema 必须在 View **之后**取，不能在里面：
+	//   - View 里再调 idx.Schema() 会二次获取读锁，写者插队时死锁；
+	//   - 而且顺序很关键：在 mark **之后**取，期间新声明的字段既在
+	//     下面的 schema 里、也在增量记录里 —— 重复无害；
+	//     若在 mark **之前**取，那段时间的声明既不在 schema 里、
+	//     也不在增量里（增量只覆盖 mark 之后），**会丢**。
+	schema := t.idx.Schema()
+
+	// 编码时复用同一块缓冲：压实可能要对几十万篇文档编码，
+	// 每篇都新分配一块会把这个操作的 GC 压力放大得很明显。
+	var scratch []byte
+
+	// 非文本字段要带上类型字节，否则重启后 number/date 会退化成 text。
+	kinds := make(map[string]uint8, len(schema))
+	for name, k := range schema {
+		if b := uint8(k); b != wal.KindFieldText {
+			kinds[name] = b
+		}
+	}
+
+	err := p.log.Compact(mark, func(emit func(wal.Kind, []byte) error) error {
+		// 先写类型声明。
+		//
+		// 这一步对**空表**是必需的：没有文档时 schema 只存在于日志的
+		// declare 记录里，压实若不重写它，重启后字段类型就全丢了。
+		if len(schema) > 0 {
+			scratch = wal.EncodeDeclare(kindBytes(schema), scratch[:0])
+			if err := emit(wal.KindDeclare, scratch); err != nil {
+				return err
+			}
+		}
+
+		for _, d := range docs {
+			scratch = wal.EncodeUpsert(d.External, d.Fields, kinds, scratch[:0])
+			if err := emit(wal.KindUpsert, scratch); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		// 压实失败**不影响数据正确性**：旧日志仍然完整，重启照常能恢复。
+		// 所以只记一条日志，不向调用方报错、也不降级。
+		if p.logger != nil {
+			p.logger.Warn("日志压实失败，继续使用原日志",
+				"table", t.Name(), "err", err)
+		}
+		return err
+	}
+
+	// 新日志里的条数 = 1 条声明（若有）+ 每篇文档一条。
+	after := int64(len(docs))
+	if len(schema) > 0 {
+		after++
+	}
+	p.writes.Store(after)
+
+	if p.logger != nil {
+		p.logger.Info("日志压实完成",
+			"table", t.Name(),
+			"docs", len(docs),
+			"log_bytes", p.log.Size(),
+		)
 	}
 	return nil
 }
@@ -241,12 +390,36 @@ func (p *persistState) replay(idx *index.InvertedIndex, logger *slog.Logger) err
 		return err
 	}
 
+	// 记下日志里现有的条数：压实就是拿它和存活文档数比。
+	p.writes.Store(int64(upserts + deletes + declares))
+
 	if logger != nil && (upserts > 0 || deletes > 0 || declares > 0) {
 		logger.Info("持久化日志重放完成",
 			"upserts", upserts, "deletes", deletes, "declares", declares,
 			"skipped_deletes", skipped, "log_bytes", p.log.Size())
 	}
 	return nil
+}
+
+// MaybeCompact 在日志明显大于存活数据时自动压实。
+//
+// **同步执行**：触发它的那次写调用会一直阻塞到压实结束。这是刻意的——
+// 嵌入方需要可预测的行为，而后台 goroutine 会让「这次写为什么慢」
+// 变得难以解释，测试也会变脆。真正的切换只阻塞极短时间，
+// 耗时的序列化不持锁，其他写者只会在切换点短暂停一下。
+//
+// 调用方必须**在索引锁之外**调用它（写路径返回之后）。
+func (t *Table) MaybeCompact() {
+	p := t.persist
+	if p == nil {
+		return
+	}
+
+	liveDocs := t.idx.Stats().Docs
+	if !p.shouldCompact(liveDocs) {
+		return
+	}
+	_ = p.compact(t)
 }
 
 // openPersist 打开某张表的持久化日志。
@@ -283,7 +456,7 @@ func openPersist(
 		return nil, fmt.Errorf("tsh: 打开表 %q 的持久化日志失败: %w", table, err)
 	}
 
-	return &persistState{log: log}, nil
+	return &persistState{log: log, logger: logger}, nil
 }
 
 // tablesDir 返回存放各表日志的目录。

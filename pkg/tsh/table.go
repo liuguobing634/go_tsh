@@ -7,7 +7,16 @@ import (
 	"github.com/liuguobing/go_tsh/internal/highlight"
 	"github.com/liuguobing/go_tsh/internal/index"
 	"github.com/liuguobing/go_tsh/internal/query"
+	"github.com/liuguobing/go_tsh/internal/tablename"
 )
+
+// DefaultTable 是默认表的名字。
+//
+// Engine 上直接调用的那些方法（Create / Upsert / Search / ...）都作用在
+// 它上面。有了这个常量，外部调用方就不必硬编码 "default"——
+// internal/tablename 是外部 module 拿不到的（跨 module 的 apicheck
+// 门禁就是这么发现这个缺口的）。
+const DefaultTable = tablename.Default
 
 // Table 是一张表：一套独立的索引、检索器、高亮器与持久化日志。
 //

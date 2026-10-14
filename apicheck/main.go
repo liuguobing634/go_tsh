@@ -122,6 +122,20 @@ func main() {
 	// ---- 9. 更细粒度的控制 ----
 	_ = engine.Index()
 
+	// ---- 9b. 持久化压实的可观测性与手动触发 ----
+	//
+	// 自动压实会在日志明显大于存活数据时自己跑；这两个读数是
+	// 「重启要做多少无用功」的度量，手动触发留给「停机前先把
+	// 重启时间压下去」这类场景。
+	tb, err := engine.Table(tsh.DefaultTable)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("日志字节:", tb.LogBytes(), "记录条数:", tb.LogRecords())
+	if err := tb.Compact(); err != nil {
+		panic(err)
+	}
+
 	// ---- 10. 错误要能被程序化判断，而不是解析文案 ----
 	_, err = engine.Table("nope")
 	fmt.Println("表不存在可判定:", err == tsh.ErrTableNotFound)

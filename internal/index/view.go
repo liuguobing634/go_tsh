@@ -116,7 +116,27 @@ func (v *View) Document(id DocID) (*Document, bool) {
 }
 
 // EachDocument 以不确定的顺序遍历快照中的全部文档。
+// fn 返回 false 时提前结束。
 //
+// # 传出去的指针可以带出 View
+//
+// 传给 fn 的 *Document 是索引内部持有的那一份。它**不会被索引修改**：
+// Upsert 覆盖一篇文档时会创建新对象，旧对象只是从内部映射里摘掉。
+//
+// 所以把这个指针带出 View（锁外）是安全的——持久化压实就靠这一点：
+// **在锁内取证，在锁外慢慢序列化**，避免把写请求停住好几秒。
+//
+// 但**不要修改它**。需要改就用 Clone。
+//
+// 需要的顺序遍历请用 SortedDocIDs。
+func (v *View) EachDocument(fn func(*Document) bool) {
+	for _, doc := range v.ix.docs {
+		if !fn(doc) {
+			return
+		}
+	}
+}
+
 // SortedDocIDs 返回快照中的全部 DocID，按升序排列。
 //
 // 用于「只有否定子句」的查询（例如 -foo）：没有任何正向子句时，

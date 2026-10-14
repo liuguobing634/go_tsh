@@ -72,6 +72,32 @@ const (
 	defaultMaxRecordBytes = 16 << 20
 )
 
+// compactSuffix 是压实期间的临时文件后缀。
+//
+// 压实先写这个文件、再改名覆盖正式文件。因此它**永远只是草稿**：
+// 启动时看到它就说明上次压实没走完，直接删掉即可，正式文件仍然完整。
+const compactSuffix = ".compact"
+
+// headerBytes 返回一个全新日志文件的文件头。
+func headerBytes() []byte {
+	h := make([]byte, headerSize)
+	copy(h, Magic)
+	h[4] = FormatVersion
+	return h
+}
+
+// EncodeRecord 把一条记录编码成完整字节：kind | length | payload | crc32。
+//
+// dst 为 nil 时自行分配；传 dst[:0] 可以复用缓冲。
+// 校验和覆盖 kind + length + payload——长度字段被写坏也能被发现。
+func EncodeRecord(kind Kind, payload []byte, dst []byte) []byte {
+	start := len(dst)
+	dst = append(dst, byte(kind))
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(payload)))
+	dst = append(dst, payload...)
+	return binary.LittleEndian.AppendUint32(dst, crc32.ChecksumIEEE(dst[start:]))
+}
+
 // Kind 是记录的类型。
 type Kind uint8
 
@@ -244,9 +270,7 @@ func (l *Log) recover() error {
 	switch size := info.Size(); {
 	case size == 0:
 		// 全新文件：写文件头。
-		header := make([]byte, headerSize)
-		copy(header, Magic)
-		header[4] = FormatVersion
+		header := headerBytes()
 		if _, err := l.f.Write(header); err != nil {
 			return fmt.Errorf("wal: 写入文件头失败: %w", err)
 		}
@@ -446,12 +470,7 @@ func (l *Log) Append(kind Kind, payload []byte) error {
 		return fmt.Errorf("wal: 记录过大: %d 字节 > 上限 %d", len(payload), l.maxRec)
 	}
 
-	buf := l.buf[:0]
-	buf = append(buf, byte(kind))
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(payload)))
-	buf = append(buf, payload...)
-	// 校验和覆盖 kind + length + payload：长度字段被写坏也能被发现。
-	buf = binary.LittleEndian.AppendUint32(buf, crc32.ChecksumIEEE(buf))
+	buf := EncodeRecord(kind, payload, l.buf[:0])
 	l.buf = buf
 
 	if _, err := l.f.Write(buf); err != nil {
@@ -531,6 +550,191 @@ func (l *Log) Size() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.size
+}
+
+// Compact 用 fn 产出的记录重写日志文件。
+//
+// # 为什么需要
+//
+// 日志是只追加的，记录的是「历史上发生过的每一次写」。同一篇文档更新
+// 10 次就有 11 条记录，重启时要把这 11 条全部重放一遍。实测 5000 篇
+// 各更新 10 次之后：日志是存活数据的 **11.6 倍**，重启耗时是
+// 「从不更新」时的 **34 倍**（详情见 docs/PERFORMANCE.md）。
+//
+// 压实把日志重写成「当前状态的快照」，两个数字都回到 1 倍附近。
+//
+// # mark 是什么
+//
+// 调用方捕获「基线状态」时的日志长度。fn 执行期间新产生的写会追加到
+// 旧文件上，Compact 会把 [mark, 当前长度) 的原始字节**接在新内容之后**，
+// 于是新日志 = 基线 + 增量 = 当前状态。
+//
+// mark 必须 ≤ 捕获基线状态时的实际偏移：
+//   - 偏大 → 那段记录两边都没有，**丢数据**；
+//   - 偏小 → 那段记录两边都有，只是多写一遍（幂等，无害）。
+//
+// 正确做法是在**同一把读锁内**同时捕获状态与 Size()。
+//
+// # 锁的边界
+//
+// fn 序列化时**不持锁**——它可能要写几百 MB，锁住等于把所有写请求停住
+// 好几秒。只有「接增量 + fsync + 改名」这一段持锁，且与索引大小无关。
+func (l *Log) Compact(mark int64, fn func(emit func(Kind, []byte) error) error) error {
+	if mark < headerSize {
+		return fmt.Errorf("wal: 压实的基线偏移 %d 不合法（至少要越过 %d 字节的文件头）",
+			mark, headerSize)
+	}
+	if fn == nil {
+		return fmt.Errorf("wal: 压实必须提供记录产出函数")
+	}
+
+	compactPath := l.path + compactSuffix
+
+	// ---- 第 1 步：不持锁，把新内容写出来 ----
+	f, err := os.Create(compactPath)
+	if err != nil {
+		return fmt.Errorf("wal: 创建压实临时文件失败: %w", err)
+	}
+
+	abort := func(cause error) error {
+		_ = f.Close()
+		_ = os.Remove(compactPath)
+		return cause
+	}
+
+	if _, err := f.Write(headerBytes()); err != nil {
+		return abort(fmt.Errorf("wal: 写压实文件头失败: %w", err))
+	}
+
+	// 用局部 scratch 而不是 l.buf：l.buf 归 Append 用，
+	// 这段代码不持锁，共用它会数据竞争。
+	var scratch []byte
+	emit := func(kind Kind, payload []byte) error {
+		scratch = EncodeRecord(kind, payload, scratch[:0])
+		if _, err := f.Write(scratch); err != nil {
+			return fmt.Errorf("wal: 写压实记录失败: %w", err)
+		}
+		return nil
+	}
+
+	if err := fn(emit); err != nil {
+		return abort(err)
+	}
+
+	// ---- 第 2 步：短锁内接增量并替换 ----
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		return abort(ErrClosed)
+	}
+
+	if err := l.appendDeltaLocked(f, mark); err != nil {
+		return abort(err)
+	}
+	if err := f.Sync(); err != nil {
+		return abort(fmt.Errorf("wal: 压实文件 fsync 失败: %w", err))
+	}
+	if err := f.Close(); err != nil {
+		return abort(fmt.Errorf("wal: 关闭压实文件失败: %w", err))
+	}
+
+	// 此刻新文件已经完整落盘，而旧文件**一个字都还没动**。
+	// 从这里到改名成功之间无论怎么崩，旧日志都是完整的。
+
+	// Windows 上目标文件还有打开的句柄时改名会失败（实测 Access is denied），
+	// 所以必须先关掉旧文件。
+	//
+	// 先把 dirty 清掉：后台 syncLoop 也走 l.mu，虽然此刻被我们挡在外面，
+	// 但清掉它可以让「句柄为空」这个窗口里任何 sync 路径都直接返回。
+	l.dirty = false
+	if err := l.f.Close(); err != nil {
+		l.dirty = true
+		if reopenErr := l.reopenLocked(); reopenErr != nil {
+			l.closed = true
+			_ = os.Remove(compactPath)
+			return fmt.Errorf("wal: 关闭旧日志失败（%w），且无法重新打开（%w）", err, reopenErr)
+		}
+		_ = os.Remove(compactPath)
+		return fmt.Errorf("wal: 关闭旧日志失败: %w（旧日志已恢复，可稍后重试）", err)
+	}
+	l.f = nil
+
+	if err := os.Rename(compactPath, l.path); err != nil {
+		// 旧文件内容完整，尽力重新打开让写路径继续可用。
+		if reopenErr := l.reopenLocked(); reopenErr != nil {
+			l.closed = true
+			_ = os.Remove(compactPath)
+			return fmt.Errorf("wal: 压实改名失败（%w），旧日志也无法重新打开（%w）",
+				err, reopenErr)
+		}
+		_ = os.Remove(compactPath)
+		return fmt.Errorf("wal: 压实改名失败: %w（旧日志已恢复，可稍后重试）", err)
+	}
+
+	// 改名成功。重新打开并**完整扫描一遍**新文件。
+	//
+	// 扫描是多余的 I/O（内容是我们刚写的），但它能证明「写出来的确实
+	// 是一份合法日志」。少了这一步，压实里任何一处记账错误都会变成
+	// 「这次能跑，下次启动才发现读不回来」——那是最难查的一类问题。
+	if err := l.reopenLocked(); err != nil {
+		l.closed = true
+		return fmt.Errorf("wal: 压实完成但重新打开失败: %w", err)
+	}
+	return nil
+}
+
+// appendDeltaLocked 把旧文件 [mark, size) 的原始字节接到 w 后面。
+//
+// 直接搬原始字节而不是解码再编码：那段本来就是合法记录，原样搬过去
+// 保证新文件仍然是合法日志，也省掉一次编解码。
+//
+// 调用方必须持有 l.mu。
+func (l *Log) appendDeltaLocked(w io.Writer, mark int64) error {
+	if mark > l.size {
+		return fmt.Errorf("wal: 基线偏移 %d 超过了日志长度 %d", mark, l.size)
+	}
+	n := l.size - mark
+	if n == 0 {
+		return nil
+	}
+
+	// 先刷一遍：同一进程内写读本来是一致的，但显式 Sync 让语义
+	// 不依赖「页缓存对同一进程立即可见」这个假设。
+	if err := l.syncLocked(); err != nil {
+		return err
+	}
+
+	buf := make([]byte, n)
+	if _, err := l.f.ReadAt(buf, mark); err != nil {
+		return fmt.Errorf("wal: 读取增量记录失败: %w", err)
+	}
+	if _, err := w.Write(buf); err != nil {
+		return fmt.Errorf("wal: 写入增量记录失败: %w", err)
+	}
+	return nil
+}
+
+// reopenLocked 重新建立文件句柄并扫描。
+//
+// 两处调用：改名成功后指向新文件，改名失败后指回旧文件。
+// 调用方必须持有 l.mu，且调用前应确保 l.f 已经关闭。
+func (l *Log) reopenLocked() error {
+	f, err := os.OpenFile(l.path, os.O_RDWR|os.O_CREATE, 0o640)
+	if err != nil {
+		return fmt.Errorf("wal: 重新打开日志失败: %w", err)
+	}
+
+	l.f = f
+	l.dirty = false
+	l.size = 0
+
+	if err := l.recover(); err != nil {
+		_ = f.Close()
+		l.f = nil
+		return err
+	}
+	return nil
 }
 
 // Path 返回日志的文件路径。
