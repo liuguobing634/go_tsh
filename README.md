@@ -363,7 +363,6 @@ CI runner 能直连 `proxy.golang.org`，不需要镜像配置；
 | `-max-doc-fields` | `TSH_MAX_DOC_FIELDS` | `32` | 单文档字段数上限 |
 | `-max-doc-tokens` | `TSH_MAX_DOC_TOKENS` | `100000` | 单文档 token 数上限 |
 | `-max-query-terms` | `TSH_MAX_QUERY_TERMS` | `32` | 单次查询 term 数上限 |
-| `-query-timeout` | `TSH_QUERY_TIMEOUT` | `5s` | 单次查询超时 |
 | `-read-timeout` | `TSH_READ_TIMEOUT` | `10s` | HTTP 读超时 |
 | `-write-timeout` | `TSH_WRITE_TIMEOUT` | `30s` | HTTP 写超时 |
 | `-idle-timeout` | `TSH_IDLE_TIMEOUT` | `60s` | HTTP 空闲连接超时 |

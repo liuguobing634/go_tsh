@@ -10,7 +10,7 @@
 //	tshd -data-dir ./data                   # 持久化，重启后数据还在
 //
 // 每个命令行参数都可被同名环境变量覆盖（前缀 TSH_、中划线转下划线并大写），
-// 例如 -query-timeout 对应 TSH_QUERY_TIMEOUT。
+// 例如 -write-timeout 对应 TSH_WRITE_TIMEOUT。
 // 命令行显式指定的值优先级最高，不会被环境变量覆盖。
 //
 // 注意：-analyzer 会决定索引里存的是什么词条，因此**换分析器必须重建索引**。

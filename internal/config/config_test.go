@@ -42,7 +42,6 @@ func TestLoadEnvOverridesDefault(t *testing.T) {
 		"TSH_ADDR":            ":9999",
 		"TSH_LOG_LEVEL":       "debug",
 		"TSH_MAX_QUERY_TERMS": "8",
-		"TSH_QUERY_TIMEOUT":   "1500ms",
 	}))
 	if err != nil {
 		t.Fatalf("Load 返回错误: %v", err)
@@ -56,7 +55,6 @@ func TestLoadEnvOverridesDefault(t *testing.T) {
 		{"Addr", cfg.HTTP.Addr, ":9999"},
 		{"LogLevel", cfg.LogLevel, "debug"},
 		{"MaxQueryTerms", cfg.MaxQueryTerms, 8},
-		{"QueryTimeout", cfg.QueryTimeout, 1500 * time.Millisecond},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -87,7 +85,7 @@ func TestLoadInvalid(t *testing.T) {
 	}{
 		{"非法日志级别", nil, map[string]string{"TSH_LOG_LEVEL": "verbose"}},
 		{"环境变量非数字", nil, map[string]string{"TSH_MAX_BODY_BYTES": "abc"}},
-		{"环境变量非法时长", nil, map[string]string{"TSH_QUERY_TIMEOUT": "3 秒"}},
+		{"环境变量非法时长", nil, map[string]string{"TSH_WRITE_TIMEOUT": "3 秒"}},
 		{"上限为负", []string{"-max-query-terms", "-1"}, nil},
 		{"上限为零", []string{"-max-doc-fields", "0"}, nil},
 		{"合成文档数为负", []string{"-generate", "-1"}, nil},
@@ -110,7 +108,7 @@ func TestEnvKey(t *testing.T) {
 		{"addr", "TSH_ADDR"},
 		{"log-level", "TSH_LOG_LEVEL"},
 		{"max-doc-tokens", "TSH_MAX_DOC_TOKENS"},
-		{"query-timeout", "TSH_QUERY_TIMEOUT"},
+		{"write-timeout", "TSH_WRITE_TIMEOUT"},
 	}
 	for _, c := range cases {
 		if got := EnvKey(c.flagName); got != c.want {

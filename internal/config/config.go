@@ -2,7 +2,7 @@
 //
 // 优先级：命令行参数 > 环境变量 > 默认值。
 // 环境变量统一使用 TSH_ 前缀，参数名中的 '-' 转为 '_' 并大写，
-// 例如 -query-timeout 对应 TSH_QUERY_TIMEOUT。
+// 例如 -write-timeout 对应 TSH_WRITE_TIMEOUT。
 package config
 
 import (
@@ -44,7 +44,6 @@ type Config struct {
 	MaxDocFields  int           // 单文档字段数上限
 	MaxDocTokens  int           // 单文档 token 数上限
 	MaxQueryTerms int           // 单次查询 term 数上限
-	QueryTimeout  time.Duration // 单次查询超时
 	ShutdownGrace time.Duration // 优雅关闭等待上限
 
 	// Analyzer 选择文本分析器："standard"（默认，英文/数字）或 "chinese"
@@ -206,7 +205,6 @@ func Default() Config {
 		MaxDocFields:  32,
 		MaxDocTokens:  100_000,
 		MaxQueryTerms: 32,
-		QueryTimeout:  5 * time.Second,
 		ShutdownGrace: 10 * time.Second,
 		Analyzer:      AnalyzerStandard,
 		SyncInterval:  100 * time.Millisecond,
@@ -240,7 +238,6 @@ func registerFlags(fs *flag.FlagSet, cfg *Config) {
 	fs.IntVar(&cfg.MaxDocFields, "max-doc-fields", cfg.MaxDocFields, "单文档字段数上限")
 	fs.IntVar(&cfg.MaxDocTokens, "max-doc-tokens", cfg.MaxDocTokens, "单文档 token 数上限")
 	fs.IntVar(&cfg.MaxQueryTerms, "max-query-terms", cfg.MaxQueryTerms, "单次查询 term 数上限")
-	fs.DurationVar(&cfg.QueryTimeout, "query-timeout", cfg.QueryTimeout, "单次查询超时")
 	fs.DurationVar(&cfg.HTTP.ReadTimeout, "read-timeout", cfg.HTTP.ReadTimeout, "HTTP 读超时")
 	fs.DurationVar(&cfg.HTTP.WriteTimeout, "write-timeout", cfg.HTTP.WriteTimeout, "HTTP 写超时")
 	fs.DurationVar(&cfg.HTTP.IdleTimeout, "idle-timeout", cfg.HTTP.IdleTimeout, "HTTP 空闲连接超时")
@@ -272,7 +269,7 @@ func Usage(w io.Writer) {
 	fmt.Fprintln(w, "用法: tshd [参数]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "每个参数都可用环境变量覆盖：加 TSH_ 前缀、中划线转下划线并大写，")
-	fmt.Fprintln(w, "例如 -query-timeout 对应 TSH_QUERY_TIMEOUT。命令行优先于环境变量。")
+	fmt.Fprintln(w, "例如 -write-timeout 对应 TSH_WRITE_TIMEOUT。命令行优先于环境变量。")
 	fmt.Fprintln(w)
 	fs.PrintDefaults()
 }
@@ -322,7 +319,7 @@ func Load(args []string, lookup func(string) string) (Config, error) {
 	return cfg, nil
 }
 
-// EnvKey 把 flag 名映射为环境变量名，例如 query-timeout -> TSH_QUERY_TIMEOUT。
+// EnvKey 把 flag 名映射为环境变量名，例如 write-timeout -> TSH_WRITE_TIMEOUT。
 func EnvKey(flagName string) string {
 	return "TSH_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
 }
@@ -405,7 +402,6 @@ func (c Config) Validate() error {
 		name string
 		val  time.Duration
 	}{
-		{"query-timeout", c.QueryTimeout},
 		// read/write/idle-timeout 由 httpapi.Options.Validate 校验。
 		{"shutdown-grace", c.ShutdownGrace},
 	}
