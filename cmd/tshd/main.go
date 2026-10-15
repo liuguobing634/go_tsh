@@ -61,6 +61,20 @@ func run(args []string) int {
 	logger := newLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 
+	// 成熟度声明。放在最前面，因为**不读 README 的人也需要看到它**——
+	// 直接 docker run 一个镜像、或者从别处拷来一份配置，都会绕过文档。
+	//
+	// 用 Warn 而不是 Info：默认级别下必须可见。想关掉的人可以用
+	// -log-level error —— 刻意不为它加一个专门的开关，
+	// 那等于给一个只该出现一次的提示增加配置面。
+	//
+	// 只加在二进制里，不加在 pkg/tsh / pkg/httpapi：库不该往调用方的
+	// 日志里塞东西，而写代码调用这些包的人本来就在读 API 文档。
+	logger.Warn("这是一个未在生产环境验证过的学习/实验项目，请勿直接用于生产",
+		"missing", "多副本、鉴权、限流、metrics、长时间稳定性验证",
+		"see", "README 的「这个项目没有在生产环境验证过」一节",
+	)
+
 	// 这些上限此前只被解析与校验，从未接进引擎——用户改了
 	// -max-doc-tokens / -max-doc-fields / -max-query-terms 不会有任何效果。
 	engine, err := newEngineWithLogger(cfg, logger)
