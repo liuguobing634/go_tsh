@@ -1,0 +1,6 @@
+# Remotion 工程的构建产物与依赖，不应提交
+node_modules/
+out/
+.tmp/
+.remotion/
+*.log

@@ -1,0 +1,26 @@
+{
+  "name": "go-tsh-documentary",
+  "version": "0.1.0",
+  "private": true,
+  "description": "go_tsh 技术纪录片第一期的 Remotion 合成工程。渲染内容全部来自 docs/video/storyboards.json 与仓库真实文件。",
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render Episode1 out/episode1.mp4 --codec h264",
+    "render:preview": "remotion render Episode1 out/preview.mp4 --codec h264 --scale 0.5",
+    "still": "remotion still Episode1 out/frame.png",
+    "typecheck": "tsc --noEmit",
+    "storyboards": "python ../../scripts/video/build-storyboards.py"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.380",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "remotion": "4.0.380"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "@types/react": "19.0.2",
+    "@types/react-dom": "19.0.2",
+    "typescript": "5.7.2"
+  }
+}
