@@ -209,7 +209,10 @@ def strip_blockquote(line: str) -> str:
 def parse_scenes(script: str) -> list[dict]:
     """Split the script into scenes and pull each scene's narration verbatim."""
     # Scene headers look like:  ## S4 · 短语查询：差 1 还是差 2（全片高潮）
-    header = re.compile(r"^## (S\d) · (.+?)\s*$", re.M)
+    # 场景标题形如：  ## S-1 · 片头：...   ## S4 · BM25：...
+    # 编号里的负号是必须支持的：片头用 S-1 表示「在原 S0 之前」。
+    # 早先写成 (S\d) 会把 S-1 整段静默丢掉，且不报错——只能靠场景数对不上才发现。
+    header = re.compile(r"^## (S-?\d) · (.+?)\s*$", re.M)
     marks = list(header.finditer(script))
     scenes = []
     for i, m in enumerate(marks):
