@@ -4,3 +4,9 @@ out/
 .tmp/
 .remotion/
 *.log
+
+# 配音合成的临时分段目录。
+# synthesize-narration.py 把每个场景逐句合成到 public/audio/_tmp/，
+# 最后拼接成 <场景>.wav 并删掉该目录。名字与 .tmp/ 只差一个点，
+# 极易漏掉——它曾以未跟踪目录的形式出现在 git status 里。
+public/audio/_tmp/
