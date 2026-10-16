@@ -24,6 +24,7 @@ import { DocTableShot } from "./shots/DocTable";
 import { ThreePanelShot } from "./shots/ThreePanel";
 import { ManimShot } from "./shots/Manim";
 import { PillarCardsShot, StatRevealShot, StatementShot } from "./shots/Statement";
+import { Cover } from "./Cover";
 
 /**
  * 一个镜头 = 一个 shot 渲染器，放在自己的 <Sequence> 里。
@@ -274,6 +275,15 @@ export const RemotionRoot: React.FC = () => {
         fps={fps}
         width={meta.resolution.width}
         height={meta.resolution.height}
+      />
+      {/* 封面：单帧即可，给足 1 秒便于导出静帧 */}
+      <Composition
+        id="Cover"
+        component={Cover}
+        durationInFrames={fps}
+        fps={fps}
+        width={1920}
+        height={1080}
       />
       <Composition
         id="DataProbe"
