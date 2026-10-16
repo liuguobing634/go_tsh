@@ -83,7 +83,11 @@ MARKDOWN: list[tuple[str, str, str]] = [
     (r"`([^`]*)`", r"\1", "行内代码去掉反引号"),
     (r"\*\*([^*]*)\*\*", r"\1", "粗体去掉星号"),
     (r"\*([^*]*)\*", r"\1", "斜体去掉星号"),
-    (r"「([^」]*)」", r"\1", "中文书名号去掉，避免读出「引号」"),
+    # ⚠️ 「」**必须保留**。
+    # 第一版把它们剥掉，结果相邻的引用项直接粘连：
+    #   「A 和 B」「A 或 B」「不要 C」  ->  A 和 BA 或 B 不要 C
+    # 读出来会变成「和BA」，语义全错。而且全片 10 个场景里有 15 处「」，
+    # 影响面并不小。多数中文 TTS 会把「」处理成自然停顿，正是我们想要的。
     (r"《([^》]*)》", r"\1", "书名号去掉"),
     (r"\[([^\]]*)\]\([^)]*\)", r"\1", "markdown 链接只读文字"),
     (r"^>\s?", "", "去掉引用符号"),
@@ -222,25 +226,40 @@ def normalize(text: str) -> tuple[str, list[dict]]:
 
 
 def split_for_tts(text: str, max_chars: int = 60) -> list[str]:
-    """按标点切句，保证单段不超长。
+    """切句。
 
-    过长的句子会让韵律在后半段漂移，而且不利于"一段一个音频文件"的对齐。
+    ⚠️ **必须尊重原文换行**。旁白是按「一行一口气」写的，
+    行边界就是作者标注的停顿点。第一版只按标点切、忽略换行，
+    结果把不同行的内容并成一句——例如
+
+        用户会写「A 和 B」「A 或 B」「不要 C」，
+        这些条件得能在文档集合上算出来。
+
+    会被并成一句，读起来赶，而且与后面字幕的分屏对不上。
+
+    规则（按优先级）：
+      1. 原文换行 = 硬边界，绝不跨越；
+      2. 行内按。！？；再切；
+      3. 仍超长才按逗号切。
     """
-    # 先按强标点切
-    parts = re.split(r"(?<=[。！？；])", text)
     chunks: list[str] = []
-    for p in parts:
-        p = p.strip()
-        if not p:
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
             continue
-        if len(p) <= max_chars:
-            chunks.append(p)
-            continue
-        # 过长再按逗号切
-        for sub in re.split(r"(?<=[，,])", p):
-            sub = sub.strip()
-            if sub:
-                chunks.append(sub)
+        # 行内先按句末标点切
+        for part in re.split(r"(?<=[。！？；])", line):
+            part = part.strip()
+            if not part:
+                continue
+            if len(part) <= max_chars:
+                chunks.append(part)
+                continue
+            # 仍超长，再按逗号切
+            for sub in re.split(r"(?<=[，,])", part):
+                sub = sub.strip()
+                if sub:
+                    chunks.append(sub)
     return chunks
 
 

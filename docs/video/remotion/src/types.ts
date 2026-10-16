@@ -162,6 +162,37 @@ export interface ThreePanelShot extends ShotBase {
   panels: { kind: string; title: string; source: string; label?: string; section?: string; want?: string }[];
 }
 
+/**
+ * 归属标注。
+ *
+ * 存在的理由：片头包含**创作者第一人称自述**，而仓库内没有可核验的对话记录，
+ * 自述不得冒充实证。因此自述场景与实证场景必须在画面上被显式区分。
+ */
+export type Attribution = "creator-statement" | "verified-facts";
+
+/** 片头 S-1：数字打字机 + 常驻归属角标。数字来自 git，写死在 params 里。 */
+export interface StatRevealShot extends ShotBase {
+  type: "stat-reveal";
+  stats: { value: string; unit: string; caption: string }[];
+  tagline: string;
+  taglineSub?: string;
+  attribution: Attribution;
+}
+
+/** 片头 S-1：单句结论 + 归属角标。 */
+export interface StatementShot extends ShotBase {
+  type: "statement";
+  text: string;
+  attribution: Attribution;
+}
+
+/** 片头 S0：四要点卡片，可收拢为一条全片导航轴。 */
+export interface PillarCardsShot extends ShotBase {
+  type: "pillar-cards";
+  pillars: { name: string; scene: string; files: string }[];
+  collapseToAxis?: boolean;
+}
+
 export type Shot =
   | CodeFileShot
   | TerminalShot
@@ -173,15 +204,26 @@ export type Shot =
   | ImportAuditShot
   | ScoreBreakdownShot
   | DocTableShot
-  | ThreePanelShot;
+  | ThreePanelShot
+  | StatRevealShot
+  | StatementShot
+  | PillarCardsShot;
 
 export interface Scene {
   id: string;
   slug: string;
   title: string;
   declaredDurationSec: number | null;
-  /** 旁白全文，逐字来自 video-script.md。 */
+  /** 旁白全文，逐字来自 video-script.md（**保留 markdown**，供核对原文）。 */
   narration: string;
+  /**
+   * 去掉 markdown 标记后的旁白，**字幕必须用它**。
+   *
+   * 直接用 narration 会让画面上出现 `**倒排索引**` 这样的星号
+   * （全片 10 个场景里有 8 个中招）。转换在构建期完成，见
+   * scripts/video/build-storyboards.py 的 narration_for_caption()。
+   */
+  narrationPlain?: string;
   narrationChars: number;
   /**
    * 字幕/旁白预算时长。

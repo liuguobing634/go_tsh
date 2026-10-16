@@ -41,21 +41,55 @@ TAIL_SEC = 1.6
 
 # Scene-level metadata that is editorial, not photographic.
 SCENE_META = {
-    "S0": {"slug": "cold-open", "palette": "black-on-white"},
-    "S1": {"slug": "positioning", "palette": "dark"},
-    "S2": {"slug": "inverted-index", "palette": "dark"},
-    "S3": {"slug": "bm25", "palette": "dark"},
-    "S4": {"slug": "phrase-query", "palette": "dark"},
-    "S5": {"slug": "boolean-concurrency", "palette": "dark"},
-    "S6": {"slug": "engineering-discipline", "palette": "dark"},
-    "S7": {"slug": "closing", "palette": "black-on-white"},
+    # 顺延后必须整体重写：原表是按旧编号写的，插入片头后 slug 与调色板
+    # 全部错位一位（例如 S1 还留着旧的 "cold-open"），只会误导排查。
+    "S-1": {"slug": "cold-open", "palette": "black-on-white"},
+    "S0": {"slug": "four-pillars", "palette": "black-on-white"},
+    "S1": {"slug": "go-mod", "palette": "black-on-white"},
+    "S2": {"slug": "positioning", "palette": "dark"},
+    "S3": {"slug": "inverted-index", "palette": "dark"},
+    "S4": {"slug": "bm25", "palette": "dark"},
+    "S5": {"slug": "phrase-query", "palette": "dark"},
+    "S6": {"slug": "boolean-concurrency", "palette": "dark"},
+    "S7": {"slug": "engineering-discipline", "palette": "dark"},
+    "S8": {"slug": "closing", "palette": "black-on-white"},
 }
 
 # Shot plans, transcribed from each scene's 「画面描述」+「架构图或动画设计说明」
 # +「需要展示的真实文件与代码」sections. x/y/w/h are 1080p canvas coordinates in
 # pixels, so the renderer needs no layout guessing.
 SHOTS = {
+    "S-1": [
+        {"type": "stat-reveal",
+         "stats": [
+             {"value": "4", "unit": "天", "caption": "全部开发时间"},
+             {"value": "48", "unit": "次提交", "caption": "1 位作者"},
+             {"value": "10,819", "unit": "行插入", "caption": "首日 78 分钟内"},
+         ],
+         "tagline": "唯一的协作者是一个 AI 编程工具",
+         "taglineSub": "DeepSeek Harness",
+         "attribution": "creator-statement",
+         "region": {"x": 260, "y": 150, "w": 1400, "h": 760}},
+
+        {"type": "statement",
+         "text": "真正的难点从来不在写，在判断。",
+         "attribution": "verified-facts",
+         "region": {"x": 260, "y": 300, "w": 1400, "h": 420}},
+    ],
+
+    # ---- 新增片头：S0 全文搜索引擎四要点 ----
     "S0": [
+        {"type": "pillar-cards",
+         "pillars": [
+             {"name": "倒排索引", "scene": "S3", "files": "internal/index/index.go"},
+             {"name": "相关性排序", "scene": "S4", "files": "internal/scoring/bm25.go"},
+             {"name": "布尔求值", "scene": "S6", "files": "internal/query/searcher.go"},
+             {"name": "短语匹配", "scene": "S5", "files": "internal/query/searcher.go"},
+         ],
+         "collapseToAxis": True,
+         "region": {"x": 80, "y": 140, "w": 1760, "h": 700}},
+    ],
+    "S1": [
         {"type": "code-file", "source": "go.mod", "lines": "1-7",
          "effect": "typewriter", "lineDelaySec": 0.4,
          "highlight": ["go 1.27", "github.com/go-ego/gse v1.1.0", "// indirect"],
@@ -63,7 +97,7 @@ SHOTS = {
         {"type": "title", "text": "go_tsh", "subtitle": "手写核心机制的 Go 全文搜索引擎",
          "region": {"x": 320, "y": 250, "w": 1280, "h": 170}},
     ],
-    "S1": [
+    "S2": [
         {"type": "import-audit",
          "packages": ["internal/index", "internal/query", "internal/scoring", "pkg/httpapi"],
          "thirdParty": [],
@@ -77,7 +111,7 @@ SHOTS = {
          "source": "docs/video/project-brief.md#6.3",
          "region": {"x": 1000, "y": 500, "w": 840, "h": 380}},
     ],
-    "S2": [
+    "S3": [
         {"type": "code-file", "source": "internal/index/types.go", "lines": "60-68",
          "highlight": ["Positions []uint32"],
          "region": {"x": 80, "y": 80, "w": 860, "h": 250}},
@@ -102,7 +136,7 @@ SHOTS = {
          "source": "docs/video/demo-cases.md#3.2",
          "region": {"x": 80, "y": 760, "w": 1760, "h": 160}},
     ],
-    "S3": [
+    "S4": [
         {"type": "code-file", "source": "internal/scoring/bm25.go", "lines": "30-49",
          "highlight": ["math.Log(1 + ", "norm := 1 - bm.B"],
          "region": {"x": 80, "y": 80, "w": 860, "h": 440}},
@@ -120,7 +154,7 @@ SHOTS = {
          "emphasise": ["dl=9", "norm=0.8500", "score=0.388458"],
          "region": {"x": 80, "y": 560, "w": 1760, "h": 360}},
     ],
-    "S4": [
+    "S5": [
         {"type": "terminal", "source": "docs/video/demo-cases.md#4.4", "section": "### 4.4 短语「相对位置差」的决定性演示（推荐镜头）", "want": "analyzer",
          "highlight": ["quick@0 brown@2", "quick@0 brown@1"],
          "region": {"x": 80, "y": 80, "w": 860, "h": 270}},
@@ -141,7 +175,7 @@ SHOTS = {
          "highlight": ["total=2", "total=0"],
          "region": {"x": 1000, "y": 580, "w": 840, "h": 340}},
     ],
-    "S5": [
+    "S6": [
         {"type": "code-file", "source": "internal/query/searcher.go", "lines": "691-708",
          "highlight": ["addExisting(&out, unionAll(should))", "v.SortedDocIDs()"],
          "region": {"x": 80, "y": 80, "w": 860, "h": 380}},
@@ -156,7 +190,7 @@ SHOTS = {
          "highlight": ["deadlock confirmed", "freezes reads too", "write lock IS held"],
          "region": {"x": 1000, "y": 500, "w": 840, "h": 420}},
     ],
-    "S6": [
+    "S7": [
         {"type": "bar-compare", "label": "代码行数",
          "items": [{"name": "源码", "value": 10501, "unit": "行"},
                    {"name": "测试", "value": 12530, "unit": "行"}],
@@ -177,7 +211,7 @@ SHOTS = {
                        "check passed"],
          "region": {"x": 80, "y": 520, "w": 1760, "h": 400}},
     ],
-    "S7": [
+    "S8": [
         {"type": "doc-table", "source": "README.md", "lines": "56-68",
          "fadeInRows": True, "region": {"x": 220, "y": 90, "w": 1480, "h": 600}},
         {"type": "title", "text": "go_tsh",
@@ -205,6 +239,26 @@ def read(path: Path) -> str:
 def strip_blockquote(line: str) -> str:
     return re.sub(r"^\s*>\s?", "", line).strip()
 
+
+def narration_for_caption(raw: str) -> str:
+    """把旁白里的 markdown 标记剥掉，供字幕显示使用。
+
+    为什么在构建期做、而不是在渲染器里做：
+      与 `resolved` 的设计一致 —— 所有文本转换都在建造期完成，渲染器只消费成品。
+      否则同一套剥离规则要在 TS 与 Python 里各写一份，迟早走偏
+      （注音表已经在 Python 侧的 prepare-narration.py 里了）。
+
+    踩过的坑：Caption 直接渲染 `narration` 字段，画面上出现 `**倒排索引**`，
+    星号被读了出来。全片 10 个场景里有 8 个受影响。
+    """
+    s = raw
+    s = re.sub(r"`([^`]*)`", r"\1", s)                  # 行内代码
+    s = re.sub(r"\*\*([^*]*)\*\*", r"\1", s)            # 粗体
+    s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", s)   # 斜体
+    s = re.sub(r"^>\s?", "", s, flags=re.M)             # 引用符号
+    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)      # 链接
+    s = "\n".join(line.strip() for line in s.split("\n"))
+    return re.sub(r"\n{2,}", "\n", s).strip()
 
 def parse_scenes(script: str) -> list[dict]:
     """Split the script into scenes and pull each scene's narration verbatim."""
@@ -238,6 +292,7 @@ def parse_scenes(script: str) -> list[dict]:
             "title": title,
             "declaredDurationSec": declared,
             "narration": narration,
+            "narrationPlain": narration_for_caption(narration),
             "narrationChars": len(re.sub(r"\s", "", narration)),
             "palette": meta.get("palette", "dark"),
             "shots": SHOTS.get(sid, []),

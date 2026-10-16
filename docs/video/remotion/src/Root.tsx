@@ -23,6 +23,7 @@ import { ScoreBreakdownShot } from "./shots/ScoreBreakdown";
 import { DocTableShot } from "./shots/DocTable";
 import { ThreePanelShot } from "./shots/ThreePanel";
 import { ManimShot } from "./shots/Manim";
+import { PillarCardsShot, StatRevealShot, StatementShot } from "./shots/Statement";
 
 /**
  * 一个镜头 = 一个 shot 渲染器，放在自己的 <Sequence> 里。
@@ -53,6 +54,12 @@ const ShotRenderer: React.FC<{ shot: Shot; scene: Scene }> = ({ shot, scene }) =
       return <ThreePanelShot {...(common as { shot: Extract<Shot, { type: "three-panel" }>; scene: Scene })} />;
     case "manim":
       return <ManimShot {...(common as { shot: Extract<Shot, { type: "manim" }>; scene: Scene })} />;
+    case "stat-reveal":
+      return <StatRevealShot {...(common as { shot: Extract<Shot, { type: "stat-reveal" }>; scene: Scene })} />;
+    case "statement":
+      return <StatementShot {...(common as { shot: Extract<Shot, { type: "statement" }>; scene: Scene })} />;
+    case "pillar-cards":
+      return <PillarCardsShot {...(common as { shot: Extract<Shot, { type: "pillar-cards" }>; scene: Scene })} />;
     default: {
       const never: never = shot;
       throw new Error(`未实现的 shot 类型：${JSON.stringify(never)}`);
@@ -149,7 +156,9 @@ const Caption: React.FC<{ scene: Scene }> = ({ scene }) => {
   const budgetFrames = Math.round(scene.narrationBudgetSec * fps);
   if (frame >= budgetFrames) return null;
 
-  const chunks = scene.narration
+  // 必须用 narrationPlain：narration 保留 markdown，直接渲染会让画面上出现
+  // `**倒排索引**` 这样的星号（全片 10 个场景里 8 个中招）。
+  const chunks = (scene.narrationPlain ?? scene.narration)
     .split(/\n/)
     .map((l) => l.trim())
     .filter(Boolean);
