@@ -1,0 +1,21 @@
+# docs/video 下的生成物 —— 由 scripts/video/ 的脚本产生，可重算
+#
+# 判断标准：**重算成本低就忽略，成本高就保留**。
+#
+#   忽略：storyboards.json / narration.* / layout-report.json / audio-manifest.json
+#         —— 跑一遍脚本是秒级到分钟级，入库只会掩盖「源码改了但忘了重跑」的漂移。
+#   保留：remotion/public/audio/*.wav
+#         —— 本地 TTS 合成 8 段要近 2 小时，属于耗时资产；
+#            入库后别人 clone 下来能直接渲染看片。它由固定随机种子生成，是确定性的。
+#
+# 注意：已有入库记录的文件，必须先 `git rm --cached` 才会真正被忽略。
+
+storyboards.json
+layout-report.json
+
+# prepare-narration.py 的输出
+narration.json
+narration.md
+
+# synthesize-narration.py 的输出清单（音频本体不忽略，见上）
+audio-manifest.json

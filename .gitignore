@@ -34,3 +34,6 @@ Thumbs.db
 # scripts/check.ps1 会自动回退到这里。
 /.gocache/
 
+# Python 缓存（scripts/video 下的工具脚本会产生）
+__pycache__/
+*.py[cod]
