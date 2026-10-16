@@ -12,3 +12,17 @@
 *.ico  binary
 *.pdf  binary
 *.zip  binary
+
+# 音视频同样必须标为 binary。
+# 否则 `* text=auto` 会把它们纳入换行符转换：
+# 二进制数据里出现 0x0D 0x0A 是常态（wav 的 PCM 采样里就有），
+# 一旦被判为文本并转换，文件内容就被破坏，
+# 而且 git 会持续报告「CRLF will be replaced by LF」这类噪音警告。
+*.wav   binary
+*.mp3   binary
+*.m4a   binary
+*.flac  binary
+*.ogg   binary
+*.opus  binary
+*.mp4   binary
+*.mov   binary
